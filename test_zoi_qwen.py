@@ -14,52 +14,131 @@ from transformers import Qwen2_5_VLForConditionalGeneration
 from qwen_vl_utils import process_vision_info
 
 
-PROMPT = """
-You are evaluating autonomous-driving planning relevance.
+# ---------------------------------------------------------------------------
+# Prompt variants
+# Use --prompt_mode full | short | strict  (default: full)
+#
+# Evaluation tips:
+#   Good output:  2-5 boxes, each with a spatial reason tied to the ego lane.
+#   Bad output:   >8 boxes, boxes on buildings/sky, boxes on every parked car,
+#                 identical boxes across very different scenes.
+#
+# Common failure modes and fixes:
+#   1. Model marks every visible car.
+#      Fix: strengthen the exclusion list; add "not every parked or distant car"
+#           explicitly in the INCLUDE section.
+#   2. Model marks background (sky, buildings, trees).
+#      Fix: the EXCLUDE section already lists these; if still happening, move
+#           exclusions to the top of the prompt.
+#   3. Model hallucinates objects not in the image.
+#      Fix: add "only annotate what you can clearly see; do not guess."
+#   4. Model outputs >10 boxes on a simple highway scene.  #      Fix: lower the box cap; add "prefer 2-4 boxes over 8 marginal ones."
+#   5. Model marks traffic lights for opposing lanes.
+#      Fix: prompt already says "governs the ego lane"; reinforce with
+#           "ignore traffic lights clearly facing away from the ego vehicle."
+# ---------------------------------------------------------------------------
 
-Given the image, identify the regions that are important for near-future driving and motion planning.
+# Full prompt — use this for all real experiments.
+PROMPT_FULL = """You are a planning-aware zone-of-interest (ZOI) annotator for an autonomous driving system.
 
-Mark only regions that can affect the ego vehicle's path, speed, safety, or decision making.
+Your task is to identify ONLY the spatial regions in this driving image that are planning-relevant — meaning they may directly affect the ego vehicle's near-future driving decisions such as braking, steering, yielding, turning, lane changes, or obstacle avoidance.
 
-Important examples:
-- vehicles that may interact with ego
-- pedestrians
-- cyclists
-- traffic lights
-- traffic signs
-- lane-relevant road boundaries
-- intersections
-- crosswalks
-- road obstacles
-- construction zones
-- occlusion regions where hidden agents may appear
-- the intended drivable corridor
+This is NOT general object detection. Do NOT annotate every visible object. Select only what matters for the immediate driving decision.
 
-Return ONLY valid JSON.
+TASK FRAMING
+The ego vehicle is the camera vehicle. The image is a front-facing or multi-camera driving view. You must identify spatial regions that constrain or influence what the ego vehicle should do in the next few seconds.
 
-Use exactly this format:
+SELECT THESE — but only if spatially relevant to the ego vehicle:
+- A vehicle directly ahead in the ego lane or actively merging into it.
+- A vehicle cutting into the ego lane or approaching from the side at an intersection.
+- A stopped or slow vehicle ahead that may require braking or a lane change.
+- A pedestrian near a crosswalk, at a road edge, or visibly about to step onto the road.
+- A cyclist on or crossing the ego vehicle's path.
+- A traffic light or traffic sign that governs the ego lane or the upcoming intersection.
+- An obstacle (debris, construction cone, barrier) blocking or narrowing the current drivable lane.
+- An intersection, merge zone, or turn area that the ego vehicle is actively approaching.
+- A road boundary, guardrail, or lane marking that constrains the drivable corridor immediately ahead.
+- An occlusion zone near a junction or crosswalk where hidden agents may suddenly emerge.
+
+DO NOT SELECT THESE — strict exclusion rules:
+- Parked cars far away or on the opposite side of the road that do not interact with the ego path.
+- Vehicles far ahead or to the side that clearly do not affect the ego vehicle's current trajectory.
+- Pedestrians on a distant sidewalk or far from any road crossing, not near the ego lane.
+- Buildings, sky, trees, poles, walls, fences, sidewalks, and general background scenery.
+- Traffic lights or signs that clearly face opposing traffic or control a different lane or direction.
+- Every car in a parking lot — only annotate the specific one requiring braking, yielding, or lane adjustment.
+- Lane markings in the far distance that do not constrain the current maneuver.
+- Road surface texture, grass, or static objects behind the ego vehicle.
+
+OUTPUT FORMAT
+Return ONLY valid JSON. No markdown. No explanation outside the JSON block.
+
+{
+  "boxes": [
+    {
+      "label": "short object label",
+      "planning_role": "dynamic_agent | traffic_rule | lane_boundary | navigation_corridor | static_obstacle | occlusion_risk | crosswalk | other",
+      "reason": "one sentence explaining the spatial relationship to the ego vehicle and what decision it affects",
+      "bbox_2d": [x1, y1, x2, y2],
+      "importance": 3
+    }
+  ]
+}
+
+FIELD DEFINITIONS
+- label: short name such as vehicle, pedestrian, cyclist, traffic_light, intersection, obstacle, cyclist, crosswalk.
+- planning_role: the functional role this region plays in the driving decision.
+- reason: must describe the spatial relationship to the ego vehicle and which decision it affects (e.g. braking, yielding, turning).
+- bbox_2d: integer pixel coordinates [x1, y1, x2, y2] within the image bounds, x1 < x2, y1 < y2.
+- importance: 5 = critical (immediate collision risk or hard constraint on the ego path), 4 = high (requires an active response such as braking or yielding), 3 = medium (should be monitored and may influence speed or steering), 2 = low (minor influence on planning), 1 = marginal.
+
+RULES
+- If no planning-relevant region is visible, return exactly: {"boxes": []}
+- Do not include text, markdown, code fences, or any content outside the JSON object.
+- Do not annotate objects that are not clearly visible in the image.
+- Coordinates must be integers within the image pixel bounds."""
+
+# Short prompt — use for quick iteration and sanity checks.
+PROMPT_SHORT = """You are a planning-aware zone annotator for autonomous driving.
+
+Select ONLY the regions that will affect the ego vehicle's near-future braking, steering, turning, or yielding.
+
+INCLUDE (only if spatially relevant to ego): vehicles in or merging into the ego lane, pedestrians near the road or crosswalk, cyclists on the path, traffic lights governing the ego lane, obstacles blocking the lane, nearby intersections, occlusion zones near crossings.
+
+EXCLUDE: parked cars far away or on the opposite side, vehicles clearly not on the ego path, pedestrians far from the road, buildings, sky, trees, traffic lights for other lanes, parking lot cars that do not interact with ego, distant lane markings, background scenery.
+
+Return ONLY valid JSON. No markdown. No text outside the JSON.
+
 {
   "boxes": [
     {
       "label": "short label",
       "planning_role": "dynamic_agent | traffic_rule | lane_boundary | navigation_corridor | static_obstacle | occlusion_risk | crosswalk | other",
-      "reason": "short reason",
+      "reason": "why this affects the ego vehicle's next action",
       "bbox_2d": [x1, y1, x2, y2],
-      "importance": 1
+      "importance": 3
     }
   ]
 }
 
-Rules:
-- bbox_2d must be [x1, y1, x2, y2].
-- Coordinates must be pixel coordinates in the input image.
-- x1 < x2 and y1 < y2.
-- importance is an integer from 1 to 5.
-- Return at most 10 boxes.
-- Prefer fewer high-confidence planning-relevant boxes.
-- Do not include markdown.
-- Do not include text outside the JSON.
-"""
+Return {"boxes": []} if nothing is planning-relevant. Max 6 boxes. Prefer fewer high-confidence boxes."""
+
+# Strict JSON-only prompt — use when the model keeps leaking text outside the JSON.
+PROMPT_STRICT = """Task: planning-aware zone-of-interest annotation for autonomous driving.
+
+Output format: a single JSON object. Nothing else. No markdown. No explanation. No code fences.
+
+Schema:
+{"boxes":[{"label":string,"planning_role":"dynamic_agent|traffic_rule|lane_boundary|navigation_corridor|static_obstacle|occlusion_risk|crosswalk|other","reason":string,"bbox_2d":[x1,y1,x2,y2],"importance":1|2|3|4|5}]}
+
+Selection rule: annotate ONLY regions that directly affect the ego vehicle's near-future braking, steering, yielding, or turning. Ignore parked cars on the opposite side, background, scenery, pedestrians far from the road, traffic signals for other lanes, and any object not clearly visible.
+
+Empty response when nothing is relevant: {"boxes":[]}
+
+Max boxes: 6. Output the JSON object now."""
+
+
+PROMPT = PROMPT_FULL  # active prompt — swap to PROMPT_SHORT or PROMPT_STRICT as needed
 
 
 def extract_json(text: str):
@@ -326,7 +405,22 @@ def main():
         help="Optional limit for quick testing.",
     )
 
+    parser.add_argument(
+        "--prompt_mode",
+        choices=["full", "short", "strict"],
+        default="full",
+        help="Which prompt variant to use (full | short | strict).",
+    )
+
     args = parser.parse_args()
+
+    global PROMPT
+    if args.prompt_mode == "short":
+        PROMPT = PROMPT_SHORT
+    elif args.prompt_mode == "strict":
+        PROMPT = PROMPT_STRICT
+    else:
+        PROMPT = PROMPT_FULL
 
     image_dir = Path(args.image_dir)
     output_dir = Path(args.output_dir)
