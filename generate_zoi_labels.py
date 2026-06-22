@@ -3,7 +3,7 @@ Offline ZOI label generator (Set-of-Marks approach).
 
 Instead of asking the VLM to DETECT planning-relevant objects (off-task, noisy
 grounding + fragile matching), we:
-  1. Load the CARLA GT boxes for a frame (boxes/XXXX.json.gz).
+  1. Load the CARLA GT boxes for a frame (boxes/XXXX.json).
   2. Filter them to the SAME set carla_garage's parse_bounding_boxes keeps,
      so our targets align with what the detector/planner actually sees.
   3. Project each GT box center into the front camera image (repo convention).
@@ -24,7 +24,6 @@ a few --debug_dir overlays before trusting a full run.
 
 import argparse
 import glob
-import gzip
 import json
 import os
 import re
@@ -98,17 +97,42 @@ def keep_box(b):
     return True
 
 
-PROMPT_TEMPLATE = """You are evaluating autonomous-driving planning relevance.
+PROMPT_TEMPLATE = """You are a planning-aware zone-of-interest (ZOI) annotator for an autonomous driving system.
 
-The image has numbered boxes drawn on objects already detected in the scene.
-For EACH numbered object, decide how important it is for the EGO vehicle's
-near-future motion planning (its path, speed, safety, or decisions).
+The image is the EGO vehicle's front camera view. Numbered green markers have
+already been placed on objects detected by the simulator's ground truth — you
+are NOT detecting objects. Your only task is to judge, for EACH numbered
+marker, how planning-relevant that object is: whether it may directly affect
+the ego vehicle's near-future driving decisions such as braking, steering,
+yielding, turning, lane changes, or obstacle avoidance over the next few
+seconds.
 
-Score importance 0-5:
-  0 = irrelevant (e.g. parked car far off the route, object behind a barrier)
-  1-2 = mildly relevant
-  3-4 = clearly relevant (may interact with ego soon)
-  5 = critical (ego must react now: crossing pedestrian, blocking vehicle, red light it faces)
+SCORE HIGH (4-5) when the marked object:
+- Is directly ahead in the ego lane or actively merging/cutting into it.
+- Is a stopped or slow vehicle ahead that may require braking or a lane change.
+- Is a pedestrian near a crosswalk, at a road edge, or visibly about to step onto the road.
+- Is a cyclist on or crossing the ego vehicle's path.
+- Is a traffic light or stop sign governing the ego lane or the upcoming intersection AND currently red/stop-relevant.
+- Is an obstacle blocking or narrowing the ego vehicle's current drivable lane.
+
+SCORE MEDIUM (2-3) when the marked object:
+- Is near the ego path but not yet requiring an active response (should be monitored).
+- Could plausibly interact with the ego vehicle if its motion or the ego's changes (e.g. a vehicle at a side street, a pedestrian on a sidewalk near the road).
+
+SCORE LOW OR ZERO (0-1) when the marked object:
+- Is parked far away or on the opposite side of the road and does not interact with the ego path.
+- Is far ahead or to the side and clearly does not affect the ego vehicle's current trajectory.
+- Is a pedestrian on a distant sidewalk, far from any road crossing.
+- Is a traffic light or sign that clearly faces opposing traffic or controls a different lane/direction.
+- Is occluded, barely visible, or has no plausible effect on ego in the next few seconds.
+
+IMPORTANCE SCALE (0-5):
+  5 = critical (immediate collision risk or hard constraint on the ego path)
+  4 = high (requires an active response such as braking or yielding)
+  3 = medium (should be monitored and may influence speed or steering)
+  2 = low (minor influence on planning)
+  1 = marginal (barely relevant)
+  0 = irrelevant (no plausible effect on ego's near-future driving)
 
 The numbered objects are:
 {object_list}
@@ -116,10 +140,10 @@ The numbered objects are:
 Return ONLY valid JSON, exactly this format:
 {{
   "scores": [
-    {{"id": 0, "importance": 3, "planning_role": "dynamic_agent | traffic_rule | static_obstacle | other", "reason": "short"}}
+    {{"id": 0, "importance": 3, "planning_role": "dynamic_agent | traffic_rule | static_obstacle | other", "reason": "one sentence: spatial relationship to ego and what decision it affects"}}
   ]
 }}
-Score every id listed. No text outside the JSON. No markdown.
+Score every id listed, even if importance is 0. No text outside the JSON. No markdown. No code fences.
 """
 
 
@@ -146,7 +170,7 @@ def draw_marks(img, marks):
 
 
 def process_frame(rgb_path, boxes_path, model, processor, debug_dir=None):
-    with gzip.open(boxes_path, "rt", encoding="utf-8") as f:
+    with open(boxes_path, "r", encoding="utf-8") as f:
         boxes = ujson.load(f)
 
     kept = [b for b in boxes if keep_box(b)]               # filtered GT set
@@ -228,16 +252,16 @@ def main():
 
     # route folders that have both rgb/ and boxes/
     routes = sorted({str(Path(p).parents[1]) for p in
-                     glob.glob(os.path.join(args.root_dir, "**", "boxes", "*.json.gz"), recursive=True)})
+                     glob.glob(os.path.join(args.root_dir, "**", "boxes", "*.json"), recursive=True)})
     print(f"found {len(routes)} route folders")
 
     done = 0
     for route in routes:
-        box_files = sorted(glob.glob(os.path.join(route, "boxes", "*.json.gz")))
+        box_files = sorted(glob.glob(os.path.join(route, "boxes", "*.json")))
         out_dir = os.path.join(route, args.out_subdir)
         os.makedirs(out_dir, exist_ok=True)
         for bf in box_files:
-            stem = Path(bf).stem.replace(".json", "")
+            stem = Path(bf).stem
             rgb = os.path.join(route, "rgb", stem + ".jpg")
             if not os.path.isfile(rgb):
                 continue
