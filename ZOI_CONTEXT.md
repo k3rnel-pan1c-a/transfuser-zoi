@@ -188,15 +188,30 @@ Train: `train.py`. Yours: `transfuser_zoi/test_zoi_qwen.py`,
 
 ## 14. Status / next steps
 DONE: design, two label generators written (`transfuser_zoi/generate_zoi_labels*.py`).
+DONE: `ZoiModule` (`team_code/zoi_module.py` — `ContinuousPositionEmbedding` + DETR-style
+query decoder) + `transfuser.py` now captures and returns a `zoi_feature_grid` (mid-stage
+fused LiDAR features, 32×32 by default via `config.zoi_src_stage=1`, channel count exposed
+as `backbone.zoi_src_channels`) + wired into `model.py` (instantiated in `__init__` when
+`config.use_zoi`, tokens concatenated onto `fused_features` right after the `model.py`
+permute, `pred_zoi_xy`/`pred_zoi_imp` added to `forward()`'s return tuple — `train.py` and
+`sensor_agent.py` call sites updated to unpack the 2 new (currently unused) values) +
+`config.py` flags added (`use_zoi, zoi_num_queries, zoi_src_stage, zoi_num_decoder_layers,
+zoi_num_heads, zoi_lambda`). `PositionEmbeddingSine` moved from `model.py` to
+`transfuser_utils.py` so both `model.py` and `zoi_module.py` can share it. Standalone
+shape/gradient sanity-checked (`carla` package not installed in this sandbox, so the full
+backbone — which needs pretrained timm weights — wasn't run end-to-end; verify on the
+training server with `config.use_zoi=True`).
 TODO (next):
 - [ ] Update label generators to start at `skip_first` and read `rgb/` (augment off).
 - [ ] Verify the 3 config constants; run `--limit 30 --debug_dir` and eyeball overlays
       (esp. projection vertical sign).
 - [ ] Download subset scenarios; download pretrained TF++ weights.
-- [ ] Write `ZoiModule` (`ContinuousPosEnc` + DETR queries) + `transfuser.py` 32×32 return
-      + 3 wiring spots in `model.py` + `config.py` flags
-      (`use_zoi, zoi_num_queries, zoi_lambda, zoi_src_stage`).
+- [ ] On the training server: instantiate `LidarCenterNet` with `use_zoi=True` and run one
+      real forward pass to confirm `zoi_src_stage=1` actually yields 32×32 for the chosen
+      `lidar_architecture` (computed generically from `feature_info`, but only sanity-checked
+      against the default `regnety_032`/256 lidar resolution math, not run).
 - [ ] Write batched `zoi_loss` (Hungarian) + `CARLA_Data.__getitem__` loads `.npy`
-      (pad to fixed M_max + validity mask).
+      (pad to fixed M_max + validity mask); wire `pred_zoi_xy`/`pred_zoi_imp` (currently
+      discarded as `_, _` in `train.py`) into `compute_loss`.
 - [ ] `--load_file strict=False` + two-LR param groups in `train.py`.
 - [ ] Train baseline (fair) + ablation rows.
