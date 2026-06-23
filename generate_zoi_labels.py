@@ -16,10 +16,11 @@ grounding + fragile matching), we:
 The saved .npy is what ZoiModule is supervised against (Hungarian matching on
 xy + BCE on importance). Locations come from GT, so they are exact.
 
-NOTE ON PROJECTION: this replicates create_projection_grid()'s convention from
-transfuser_utils.py (CARLA x-front/y-right/z-up -> pinhole, camera at camera_pos,
-zero rotation). The vertical (z) sign in that convention is subtle; ALWAYS eyeball
-a few --debug_dir overlays before trusting a full run.
+NOTE ON PROJECTION: based on create_projection_grid()'s convention from transfuser_utils.py
+(CARLA x-front/y-right/z-up -> pinhole, camera at camera_pos, zero rotation), but with the
+height (z) term NEGATED relative to that function -- verified empirically against real
+--debug_dir overlays (un-negated, markers float well above the actual objects). ALWAYS
+eyeball a few overlays on a new dataset/camera config before trusting a full run.
 """
 
 import argparse
@@ -66,10 +67,16 @@ K = intrinsic_matrix(CAMERA_FOV, CAMERA_HEIGHT, CAMERA_WIDTH)
 
 def project_ego_to_image(pos_xyz):
     """Ego/vehicle frame (CARLA x-front, y-right, z-up) -> image (u, v, depth).
-    Returns None if behind the camera. Mirrors create_projection_grid()."""
+    Returns None if behind the camera.
+
+    NOTE: this does NOT literally match create_projection_grid()'s un-negated height
+    term -- empirically (see --debug_dir overlays on real frames) that produces markers
+    that float well above the actual objects. z must be negated to go from CARLA's
+    z-up to the pinhole camera's y-down convention.
+    """
     p = np.asarray(pos_xyz, dtype=np.float64) - np.asarray(CAMERA_POS)
     # CARLA (x front, y right, z up) -> pinhole (x right, y down, z front)
-    cam = np.array([p[1], p[2], p[0]])          # [y, z, x]
+    cam = np.array([p[1], -p[2], p[0]])          # [y, -z, x]
     depth = cam[2]
     if depth <= 0.1:
         return None                              # behind / at camera plane
