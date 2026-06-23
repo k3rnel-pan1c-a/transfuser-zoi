@@ -238,7 +238,11 @@ def process_frame(rgb_path, boxes_path, model, processor, debug_dir=None):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--root_dir", required=True, help="dataset root (contains route folders)")
-    ap.add_argument("--out_subdir", default="zoi_labels", help="written inside each route folder")
+    ap.add_argument("--out_subdir", default="zoi_labels", help="subfolder name for the written .npy files")
+    ap.add_argument("--output_dir", default=None,
+                    help="if set, mirror each route's path (relative to --root_dir) under this writable "
+                         "directory instead of writing inside the route folder itself. Use this when "
+                         "--root_dir is read-only (e.g. a mounted Kaggle input dataset).")
     ap.add_argument("--model", default="Qwen/Qwen2.5-VL-7B-Instruct")
     ap.add_argument("--debug_dir", default=None, help="if set, save a few marked overlays here")
     ap.add_argument("--debug_n", type=int, default=20)
@@ -258,7 +262,11 @@ def main():
     done = 0
     for route in routes:
         box_files = sorted(glob.glob(os.path.join(route, "boxes", "*.json")))
-        out_dir = os.path.join(route, args.out_subdir)
+        if args.output_dir:
+            route_rel = os.path.relpath(route, args.root_dir)
+            out_dir = os.path.join(args.output_dir, route_rel, args.out_subdir)
+        else:
+            out_dir = os.path.join(route, args.out_subdir)
         os.makedirs(out_dir, exist_ok=True)
         for bf in box_files:
             stem = Path(bf).stem
