@@ -215,3 +215,78 @@ TODO (next):
       discarded as `_, _` in `train.py`) into `compute_loss`.
 - [ ] `--load_file strict=False` + two-LR param groups in `train.py`.
 - [ ] Train baseline (fair) + ablation rows.
+
+## 15. Session update (2026-06-25) — Kaggle dataset, projection verified, signal-marking fix
+
+Work done against the Kaggle dump `/kaggle/input/datasets/k3rnelpan1ca/carla-garage`
+(6 scenarios: PedestrianCrossing, DynamicObjectCrossing, HighwayCutIn,
+SignalizedJunctionLeftTurn, ParkedObstacleTwoWays, noScenarios). All new code in
+`transfuser-zoi/`; preview artifacts in `/kaggle/working/zoi_preview/`.
+
+### New / changed files (what each does)
+- **`zoi_projection.py` (NEW, shared, torch-free).** Single source of truth for the
+  projection + Set-of-Marks geometry: `project_ego_to_image(z_sign=-1)`, `keep_box`,
+  `visible_marks(classes=VLM_MARK_CLASSES)`, `draw_marks`, `rule_importance`. Imported by
+  generate_zoi_labels.py / preview_zoi_projection.py / verify_projection.py /
+  run_vlm_multiframe.py (geometry was duplicated before → drift risk). **This is the file
+  that holds the projection + traffic-light fix.**
+- **`verify_projection.py` (NEW).** Renders the `*_projcheck.jpg` overlays that prove the
+  z-sign: GREEN = `z_sign=-1` (correct, lands on objects), RED = `+1` (old bug, floats up),
+  on brightened frames. Produced the 6 `<tag>_projcheck.jpg` preview images.
+- **`run_vlm_multiframe.py` (NEW).** Multi-frame, multi-model (`gemma3|gemma4|qwen`) runner.
+  Its `build_marked()` writes the `<tag>_marked.jpg` Set-of-Marks images and it writes
+  `multiframe_{scores.json,compare.md}` + `<tag>__<model>.{json,txt}`. Frames come from
+  `_preview_frames.json` (one diverse frame per scenario; selected by an inline snippet).
+  The post-fix `_marked.jpg` re-render used an inline loop calling
+  `zoi_projection.visible_marks`+`draw_marks` (equivalent to `build_marked`).
+- **`sample_zoi_dataset.py` (NEW).** See §6/§16. Builds a carla_garage-loadable train/eval
+  tree + label manifest from the Kaggle dump.
+- **`generate_zoi_labels.py` (CHANGED).** Now: imports shared geometry; reads `.json` OR
+  `.json.gz`; has `--skip_first`/`--stride`; **scores traffic_light/stop_sign by RULE and
+  marks only car/walker** (see signal fix below).
+- **`preview_zoi_projection.py` (CHANGED).** Imports from `zoi_projection` (works without VLM libs).
+
+### Projection z-sign — VERIFIED CORRECT (was not actually a bug)
+`cam=[p_y, -p_z, p_x]`, `p=pos-CAMERA_POS([-1.5,0,2.0])`; `-p_z` (z_sign=-1) puts marks ON
+objects, `+p_z` floats them above. Confirmed on 6 diverse frames (`*_projcheck.jpg`). The
+old floating marks in `0035_marked.jpg`/`0035_compare.jpg` were the pre-fix version.
+TODO §14 "verify projection vertical sign" → **DONE**.
+
+### Signal marking fix (the real issue) — `traffic_light`/`stop_sign`
+In this dump a signal box `position` is the **road-level stop-line trigger (z≈0.35m, ~20m
+ahead), NOT the visible fixture** → a projected dot lands on the road or ON a car ahead and
+misleads the VLM (e.g. junction frame: 4 marks = 2 cars + 2 mis-located lights, one drawn on
+the blue car). Fix in `zoi_projection.py`: `VLM_MARK_CLASSES={car,walker}` get VLM marks;
+`RULE_CLASSES={traffic_light,stop_sign}` get `rule_importance` (red+affects_ego light→1.0,
+stop_sign→0.8) and are NOT shown to the VLM. `keep_box` already restricts signals to
+red+affects_ego, so a kept signal is relevant by definition. Data caveat: some visible PARKED
+cars aren't in CARLA GT (untracked static) → unmarkable by any model.
+
+### VLM model finding (single frame 0035 + multi-frame)
+Flat Qwen baseline = all "3" (no gradient → useless teacher; brightening doesn't fix).
+Gemma 3 12B ≈ Gemma 4 12B (both graded/sensible). **Default Gemma 3 12B (4-bit) on T4**,
+Gemma 4 only on A100. Run gotchas: needs `bitsandbytes`+`qwen-vl-utils`; the verbose prompt
++256 tokens TRUNCATES JSON on frames with ≥6 marks → parse fails (use the COMPACT
+id+importance prompt); `nohup &` orphans hold GPU mem → OOM (use proper backgrounding +
+`pkill`/`nvidia-smi --query-compute-apps`).
+
+## 16. Data subset & the "perfect-expert" filter (Kaggle)
+carla_garage `data.py` (~L100-110) **silently drops any route whose expert run wasn't a
+perfect drive**: `results.json` status `Completed` AND `score_composed==100`, UNLESS the only
+infractions are min-speed. (It's imitation learning — imperfect demos teach bad behavior.)
+This is why a balanced 5k request yields only **~3,665 train + ~817 eval** frames; trainable
+routes are scarce in some scenarios (HighwayCutIn 8/98, SignalizedJunctionLeftTurn 52/347;
+noScenarios 253, DynamicObjectCrossing 139, PedestrianCrossing 54, ParkedObstacleTwoWays 45).
+`sample_zoi_dataset.py` replicates this filter, splits train/eval by town (`--eval_town 13`),
+fixes 2 format mismatches (dump stores PLAIN json + DOUBLE-nests `<Scn>/<Scn>/<route>`;
+data.py wants GZIP `*.json.gz`/`results.json.gz` + immediate-subdir routes → it
+gzips boxes/measurements/results, symlinks the rest, flattens to `<Scn>/<route>`), and emits
+`_manifest/{train_labels.txt,eval_labels.txt,summary.json}`. Recommended POC: ~5k labeled
+frames (debug at ~1-1.5k), stride 5, skip_first 10, Town13 held out, ParkedObstacle as
+negatives. Full build not yet run.
+
+### TODO delta from this session
+- [x] Projection vertical sign verified; geometry centralized in `zoi_projection.py`.
+- [x] Label generators: `--skip_first`/`--stride`, gz-aware, signal rule-scoring.
+- [ ] Switch VLM runners to the COMPACT prompt before the real label/compare run.
+- [ ] Run `sample_zoi_dataset.py` full build (~212 routes); then generate labels on it.
