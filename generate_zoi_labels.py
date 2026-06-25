@@ -36,72 +36,17 @@ import torch
 import ujson
 from PIL import Image
 from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
-from qwen_vl_utils import process_vision_info
+# qwen_vl_utils is imported lazily inside process_frame so that other tools can
+# reuse PROMPT_TEMPLATE / extract_json without having that package installed.
 
-
-# --- must mirror carla_garage/team_code/config.py -----------------------------
-CAMERA_POS = [-1.5, 0.0, 2.0]      # x, y, z mounting position of the camera
-CAMERA_FOV = 110
-CAMERA_WIDTH = 1024
-CAMERA_HEIGHT = 512
-MIN_X, MAX_X = -32.0, 32.0
-MIN_Y, MAX_Y = -32.0, 32.0
-MIN_Z, MAX_Z = -3.0, 3.0           # height filter; check config.min_z/max_z
-# Same classes / order as parse_bounding_boxes + visualize_dataset color map.
-CLASS_TO_ID = {"car": 0, "walker": 1, "traffic_light": 2, "stop_sign": 3}
-# LiDAR-hit thresholds from config.py (verify exact values in your config).
-NUM_LIDAR_HITS_CAR = 1
-NUM_LIDAR_HITS_WALKER = 1
-# ------------------------------------------------------------------------------
-
-
-def intrinsic_matrix(fov, height, width):
-    f = width / (2.0 * np.tan(fov * np.pi / 360.0))
-    return np.array([[f, 0.0, width / 2.0],
-                     [0.0, f, height / 2.0],
-                     [0.0, 0.0, 1.0]], dtype=np.float64)
-
-
-K = intrinsic_matrix(CAMERA_FOV, CAMERA_HEIGHT, CAMERA_WIDTH)
-
-
-def project_ego_to_image(pos_xyz):
-    """Ego/vehicle frame (CARLA x-front, y-right, z-up) -> image (u, v, depth).
-    Returns None if behind the camera.
-
-    NOTE: this does NOT literally match create_projection_grid()'s un-negated height
-    term -- empirically (see --debug_dir overlays on real frames) that produces markers
-    that float well above the actual objects. z must be negated to go from CARLA's
-    z-up to the pinhole camera's y-down convention.
-    """
-    p = np.asarray(pos_xyz, dtype=np.float64) - np.asarray(CAMERA_POS)
-    # CARLA (x front, y right, z up) -> pinhole (x right, y down, z front)
-    cam = np.array([p[1], -p[2], p[0]])          # [y, -z, x]
-    depth = cam[2]
-    if depth <= 0.1:
-        return None                              # behind / at camera plane
-    uv = K @ cam
-    return uv[0] / depth, uv[1] / depth, depth
-
-
-def keep_box(b):
-    """Replicates parse_bounding_boxes filtering so targets match the model's set."""
-    if b.get("class") not in CLASS_TO_ID:
-        return False
-    if "num_points" in b:
-        if b["class"] == "walker" and b["num_points"] <= NUM_LIDAR_HITS_WALKER:
-            return False
-        if b["class"] == "car" and b["num_points"] <= NUM_LIDAR_HITS_CAR:
-            return False
-    if b["class"] == "traffic_light":
-        if not b.get("affects_ego") or b.get("state") == "Green":
-            return False
-    if b["class"] == "stop_sign" and not b.get("affects_ego"):
-        return False
-    x, y, z = b["position"]
-    if not (MIN_X < x < MAX_X and MIN_Y < y < MAX_Y and MIN_Z < z < MAX_Z):
-        return False
-    return True
+# Projection + Set-of-Marks geometry now live in ONE shared, torch-free module
+# (zoi_projection.py) so the preview/overlay tools and this generator can never
+# drift apart. The z-sign there is verified empirically (verify_projection.py).
+from zoi_projection import (
+    CAMERA_WIDTH, CAMERA_HEIGHT, CLASS_TO_ID,
+    VLM_MARK_CLASSES, RULE_CLASSES, rule_importance,
+    project_ego_to_image, keep_box, draw_marks,
+)
 
 
 PROMPT_TEMPLATE = """You are a planning-aware zone-of-interest (ZOI) annotator for an autonomous driving system.
@@ -165,20 +110,19 @@ def extract_json(text):
     raise ValueError("could not parse VLM JSON")
 
 
-def draw_marks(img, marks):
-    """marks: list of (id, u, v). Draws a labeled dot per object."""
-    out = img.copy()
-    for oid, u, v in marks:
-        u, v = int(round(u)), int(round(v))
-        cv2.circle(out, (u, v), 6, (0, 255, 0), -1)
-        cv2.putText(out, str(oid), (u + 6, v - 6), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.8, (0, 0, 255), 2, cv2.LINE_AA)
-    return out
+def load_boxes(boxes_path):
+    """Read a boxes file, transparently handling .json and gzipped .json.gz
+    (the built training tree gzips sidecars; the raw Kaggle dump does not)."""
+    if boxes_path.endswith(".gz"):
+        import gzip
+        with gzip.open(boxes_path, "rt", encoding="utf-8") as f:
+            return ujson.load(f)
+    with open(boxes_path, "r", encoding="utf-8") as f:
+        return ujson.load(f)
 
 
 def process_frame(rgb_path, boxes_path, model, processor, debug_dir=None):
-    with open(boxes_path, "r", encoding="utf-8") as f:
-        boxes = ujson.load(f)
+    boxes = load_boxes(boxes_path)
 
     kept = [b for b in boxes if keep_box(b)]               # filtered GT set
     n = len(kept)
@@ -188,10 +132,19 @@ def process_frame(rgb_path, boxes_path, model, processor, debug_dir=None):
         x, y, _ = b["position"]
         targets[i, 0], targets[i, 1] = x, y
         targets[i, 3] = CLASS_TO_ID[b["class"]]
+        # Signals (traffic_light / stop_sign): GT position is a road-level stop-line
+        # trigger, NOT the visible fixture, so a Set-of-Marks dot would land on the
+        # road or another vehicle and mislead the VLM. keep_box already restricts
+        # them to red+affects_ego / affects_ego, so they ARE planning-relevant ->
+        # score by rule and DON'T show them to the VLM.
+        if b["class"] in RULE_CLASSES:
+            targets[i, 2] = rule_importance(b)
 
-    # Which kept objects are visible in the front camera -> get a mark id.
+    # Only cars/walkers get a VLM mark (their GT position lands on the object).
     marks, id_to_row, object_lines = [], {}, []
     for i, b in enumerate(kept):
+        if b["class"] not in VLM_MARK_CLASSES:
+            continue
         proj = project_ego_to_image(b["position"])
         if proj is None:
             continue
@@ -213,6 +166,7 @@ def process_frame(rgb_path, boxes_path, model, processor, debug_dir=None):
 
     messages = [{"role": "user", "content": [{"type": "image", "image": pil},
                                              {"type": "text", "text": prompt}]}]
+    from qwen_vl_utils import process_vision_info
     text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     image_inputs, _ = process_vision_info(messages)
     inputs = processor(text=[text], images=image_inputs, padding=True, return_tensors="pt").to(model.device)
@@ -254,6 +208,12 @@ def main():
     ap.add_argument("--debug_dir", default=None, help="if set, save a few marked overlays here")
     ap.add_argument("--debug_n", type=int, default=20)
     ap.add_argument("--limit", type=int, default=0, help="cap frames (0 = all) for a quick test")
+    ap.add_argument("--skip_first", type=int, default=10,
+                    help="skip the first N saved frames per route (OOD warm-up; "
+                         "mirrors config.skip_first). Match what training uses.")
+    ap.add_argument("--stride", type=int, default=1,
+                    help="label every Nth frame per route (temporal subsample; "
+                         "match config.train_sampling_rate used in training).")
     args = ap.parse_args()
 
     model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
@@ -261,14 +221,16 @@ def main():
     processor = AutoProcessor.from_pretrained(args.model)
     model.eval()
 
-    # route folders that have both rgb/ and boxes/
-    routes = sorted({str(Path(p).parents[1]) for p in
-                     glob.glob(os.path.join(args.root_dir, "**", "boxes", "*.json"), recursive=True)})
+    # route folders that have both rgb/ and boxes/ (boxes may be .json or .json.gz)
+    box_glob = (glob.glob(os.path.join(args.root_dir, "**", "boxes", "*.json"), recursive=True) +
+                glob.glob(os.path.join(args.root_dir, "**", "boxes", "*.json.gz"), recursive=True))
+    routes = sorted({str(Path(p).parents[1]) for p in box_glob})
     print(f"found {len(routes)} route folders")
 
     done = 0
     for route in routes:
-        box_files = sorted(glob.glob(os.path.join(route, "boxes", "*.json")))
+        box_files = sorted(glob.glob(os.path.join(route, "boxes", "*.json")) +
+                           glob.glob(os.path.join(route, "boxes", "*.json.gz")))
         if args.output_dir:
             route_rel = os.path.relpath(route, args.root_dir)
             out_dir = os.path.join(args.output_dir, route_rel, args.out_subdir)
@@ -276,7 +238,12 @@ def main():
             out_dir = os.path.join(route, args.out_subdir)
         os.makedirs(out_dir, exist_ok=True)
         for bf in box_files:
-            stem = Path(bf).stem
+            stem = os.path.basename(bf).split(".")[0]   # 0010.json / 0010.json.gz -> 0010
+            # mirror training's frame selection: drop warm-up frames + subsample
+            if stem.isdigit():
+                fi = int(stem)
+                if fi < args.skip_first or fi % args.stride != 0:
+                    continue
             rgb = os.path.join(route, "rgb", stem + ".jpg")
             if not os.path.isfile(rgb):
                 continue
