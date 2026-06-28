@@ -8,13 +8,21 @@ For each frame it:
   2. asks each model to score every mark (0-5), saves <tag>__<model>.json + .txt
   3. writes multiframe_scores.json (all models x all frames) + a markdown table.
 
-Backends (pick with --models):
-  gemma3 : unsloth/gemma-3-12b-it-bnb-4bit      (4-bit, fits one T4; the recommended labeler)
-  gemma4 : unsloth/gemma-4-12b-it               (bf16, sharded across both T4s)
-  qwen   : Qwen/Qwen2.5-VL-7B-Instruct          (needs qwen_vl_utils)
+Backends (pick with --models) — all full-precision bf16 for an apples-to-apples comparison:
+  gemma3   : unsloth/gemma-3-12b-it       (bf16, sharded across both T4s)
+  gemma4   : unsloth/gemma-4-12b-it       (bf16, sharded across both T4s)
+  internvl : OpenGVLab/InternVL3_5-8B-HF  (bf16, sharded across both T4s)
+  qwen     : Qwen/Qwen2.5-VL-7B-Instruct  (bf16; needs qwen_vl_utils)
 
 Usage (frames come from _preview_frames.json by default, written by the selector):
-  python run_vlm_multiframe.py --models gemma3 --max_new_tokens 256
+  python run_vlm_multiframe.py --models gemma3 gemma4 qwen internvl \
+      --prompt compact --out_dir /kaggle/working/zoi_preview_compare
+
+--prompt options (all use compact JSON output to avoid token-cap truncation):
+  compact          — bare 0-5 scale only (original)
+  exemplar         — same as compact + one concrete driving scenario per score level
+  egopathconflict  — alternative framing: "does this object conflict with the ego path?"
+  full             — adds per-id reason/role text (verbose; can truncate on many marks)
 """
 import argparse
 import gc
@@ -30,13 +38,44 @@ import torch
 
 from zoi_projection import visible_marks, draw_marks
 from generate_zoi_labels import PROMPT_TEMPLATE, extract_json
+from zoi_prompts import EXEMPLAR_PROMPT, EGOPATHCONFLICT_PROMPT
 
 OUT_DIR = "/kaggle/working/zoi_preview"
+# All full-precision (bf16), no 4-bit, so the comparison is apples-to-apples. The 12B
+# Gemmas don't fit one 15GB T4 in bf16 (~24GB) -> device_map="auto" shards across both T4s.
 MODEL_IDS = {
-    "gemma3": "unsloth/gemma-3-12b-it-bnb-4bit",
-    "gemma4": "unsloth/gemma-4-12b-it",
+    "gemma3": "unsloth/gemma-3-12b-it",      # bf16 (was the -bnb-4bit mirror)
+    "gemma4": "unsloth/gemma-4-12b-it",      # bf16
     "qwen": "Qwen/Qwen2.5-VL-7B-Instruct",
+    "internvl": "OpenGVLab/InternVL3_5-8B-HF",  # bf16 (no 12B variant; 8B is the safe fit)
 }
+
+# Compact prompt: only id+importance -> short JSON that won't hit the token cap.
+COMPACT_PROMPT_TEMPLATE = """You are a planning-relevance annotator for an autonomous driving system.
+The image is the EGO vehicle's front camera. Numbered green markers are already placed on
+objects detected by the simulator's ground truth — you are NOT detecting objects. For EACH
+numbered marker, rate how planning-relevant that object is to the ego's near-future driving
+decisions (braking, steering, yielding, lane changes, obstacle avoidance) over the next few
+seconds.
+
+IMPORTANCE SCALE (0-5):
+  5 = critical  — object is IN the ego path right now; immediate braking or swerving required
+  4 = high      — object will enter ego path within 1-2 s; ego must respond now
+  3 = medium    — object is near the ego path and worth monitoring; may require speed/steering adjustment
+  2 = low       — object is in an adjacent lane with no sign of merging, or is >25 m away in a non-threatening position
+  1 = marginal  — object is clearly in a different lane and far away (>25 m), or moving away from ego
+  0 = irrelevant — object is parked, stationary far off-path, in an opposing lane going the other way,
+                   or so far away (>40 m) that no action is needed regardless of what it does
+
+DEFAULT RULE: if an object is in a DIFFERENT lane from the ego and shows NO sign of merging or cutting in,
+score it 0-1 regardless of distance. Reserve 2+ only for objects on or converging toward the ego lane.
+
+The numbered objects are:
+{object_list}
+
+Return ONLY compact JSON, no prose, no markdown, no code fences:
+{{"scores": [{{"id": 0, "importance": 3}}]}}
+Score every id listed."""
 
 
 def brighten(img, gamma=0.5):
@@ -127,9 +166,21 @@ def main():
     ap.add_argument("--models", nargs="+", default=["gemma3"],
                     choices=list(MODEL_IDS))
     ap.add_argument("--max_new_tokens", type=int, default=512)
+    ap.add_argument("--prompt",
+                    choices=["compact", "full", "exemplar", "egopathconflict"],
+                    default="compact",
+                    help="compact = id+importance only; full = +reason/role text; "
+                         "exemplar = compact + per-score driving examples; "
+                         "egopathconflict = alternative spatial-conflict framing")
     ap.add_argument("--out_dir", default=OUT_DIR)
     args = ap.parse_args()
     os.makedirs(args.out_dir, exist_ok=True)
+    prompt_template = {
+        "compact": COMPACT_PROMPT_TEMPLATE,
+        "full": PROMPT_TEMPLATE,
+        "exemplar": EXEMPLAR_PROMPT,
+        "egopathconflict": EGOPATHCONFLICT_PROMPT,
+    }[args.prompt]
 
     picks = json.load(open(args.frames_json))
     # build all marked images first (no model needed)
@@ -158,7 +209,7 @@ def main():
     for kind in args.models:
         model, proc = load_model(kind)
         for tag, route_dir, stem, pil, object_lines, marks in frames:
-            prompt = PROMPT_TEMPLATE.format(object_list="\n".join(object_lines))
+            prompt = prompt_template.format(object_list="\n".join(object_lines))
             t0 = time.time()
             raw = generate(kind, model, proc, pil, prompt, args.max_new_tokens)
             dt = time.time() - t0
@@ -179,7 +230,11 @@ def main():
 
     # markdown comparison
     lines = ["# Multi-frame ZOI VLM comparison\n",
-             f"Models: {', '.join(args.models)}\n"]
+             f"prompt mode: **{args.prompt}**, max_new_tokens={args.max_new_tokens}\n",
+             "Models:\n"]
+    for m in args.models:
+        lines.append(f"- `{m}` = {MODEL_IDS[m]}")
+    lines.append("\nimportance 0-5 (blank = the model didn't return / parse that id)\n")
     for tag, r in results.items():
         lines.append(f"\n## {tag}\nscene: `{os.path.basename(r['route'])}` frame {r['stem']}\n")
         ids = sorted(r["classes"])
