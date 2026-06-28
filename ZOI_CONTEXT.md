@@ -201,6 +201,19 @@ zoi_num_heads, zoi_lambda`). `PositionEmbeddingSine` moved from `model.py` to
 shape/gradient sanity-checked (`carla` package not installed in this sandbox, so the full
 backbone — which needs pretrained timm weights — wasn't run end-to-end; verify on the
 training server with `config.use_zoi=True`).
+DONE (2026-06-28 — model training path fully wired, see §18):
+- `zoi_loss` (batched Hungarian) added to `model.py` `compute_loss` as `_compute_zoi_loss`;
+  position L1 on matched queries + importance BCE on ALL queries (matched→GT importance,
+  unmatched→0 so the gating score learns (ir)relevance). Standalone gradient test passed.
+- `CARLA_Data.__getitem__` loads `zoi_labels/XXXX.npy` (pad to `zoi_m_max`, validity mask),
+  and applies `augment_route` to the label xy so it tracks viewpoint aug (identity at augment=0).
+- `train.py` unpacks `pred_zoi_xy`/`pred_zoi_imp`, passes labels to `compute_loss`, sets
+  `loss_zoi` weight = `zoi_lambda`, and builds TWO LR groups (planner at base LR, ZoiModule
+  at `base_lr * zoi_lr_multiplier`). `strict=False` load already present.
+- `config.py`: `loss_zoi` weight (default 0.0), `zoi_m_max=20`, `zoi_lr_multiplier=10.0` added.
+- Ablation knobs fall out: `--use_zoi 1 --zoi_lambda 1.0` = the claim; `--zoi_lambda 0.0` =
+  unsupervised control (tokens still flow via the indirect pathway, supervision off);
+  `--use_zoi 0` = fair baseline.
 TODO (next):
 - [ ] Update label generators to start at `skip_first` and read `rgb/` (augment off).
 - [ ] Verify the 3 config constants; run `--limit 30 --debug_dir` and eyeball overlays
@@ -209,11 +222,8 @@ TODO (next):
 - [ ] On the training server: instantiate `LidarCenterNet` with `use_zoi=True` and run one
       real forward pass to confirm `zoi_src_stage=1` actually yields 32×32 for the chosen
       `lidar_architecture` (computed generically from `feature_info`, but only sanity-checked
-      against the default `regnety_032`/256 lidar resolution math, not run).
-- [ ] Write batched `zoi_loss` (Hungarian) + `CARLA_Data.__getitem__` loads `.npy`
-      (pad to fixed M_max + validity mask); wire `pred_zoi_xy`/`pred_zoi_imp` (currently
-      discarded as `_, _` in `train.py`) into `compute_loss`.
-- [ ] `--load_file strict=False` + two-LR param groups in `train.py`.
+      against the default `regnety_032`/256 lidar resolution math, not run). Also confirm the
+      DDP `id()`-based param split in `train.py` covers exactly `zoi_module.*`.
 - [ ] Train baseline (fair) + ablation rows.
 
 ## 15. Session update (2026-06-25) — Kaggle dataset, projection verified, signal-marking fix
@@ -271,12 +281,21 @@ id+importance prompt); `nohup &` orphans hold GPU mem → OOM (use proper backgr
 `pkill`/`nvidia-smi --query-compute-apps`).
 
 ## 16. Data subset & the "perfect-expert" filter (Kaggle)
-carla_garage `data.py` (~L100-110) **silently drops any route whose expert run wasn't a
-perfect drive**: `results.json` status `Completed` AND `score_composed==100`, UNLESS the only
-infractions are min-speed. (It's imitation learning — imperfect demos teach bad behavior.)
-This is why a balanced 5k request yields only **~3,665 train + ~817 eval** frames; trainable
-routes are scarce in some scenarios (HighwayCutIn 8/98, SignalizedJunctionLeftTurn 52/347;
-noScenarios 253, DynamicObjectCrossing 139, PedestrianCrossing 54, ParkedObstacleTwoWays 45).
+carla_garage `data.py` (~L96-110) **silently drops any route whose expert drive wasn't
+(essentially) perfect** — it's imitation learning, so imperfect demos teach bad behavior.
+EXACT rule: drop if `score_composed < 100` AND infractions aren't ALL min-speed (a real
+infraction happened), OR status in {`Failed`, `Failed - Agent crashed`,
+`Failed - Simulation crashed`, `Failed - Agent couldn't be set up`}, OR name starts
+`FAILED_`. Otherwise KEEP. **`Perfect` AND `Completed` are both kept**; min-speed-only
+infractions are forgiven (the cautious expert often drives slow → score<100 but that's fine
+to imitate). Dataset statuses: Perfect 662, Completed 577, Failed-timed-out 17, Failed-blocked 2.
+Trainable per scenario (corrected): DynamicObjectCrossing 263, SignalizedJunctionLeftTurn
+337, noScenarios 350, PedestrianCrossing 95, ParkedObstacleTwoWays 87, HighwayCutIn 81 →
+the full **~5k train + ~1k eval** budget is easily met.
+
+NOTE: an earlier version of `sample_zoi_dataset.py` wrongly also required status=="Completed",
+discarding all 662 `Perfect` routes and producing the bogus "scarce data" counts (~3,665
+frames; SignalizedJunctionLeftTurn 52/347 etc.). FIXED — `is_trainable` now mirrors data.py.
 `sample_zoi_dataset.py` replicates this filter, splits train/eval by town (`--eval_town 13`),
 fixes 2 format mismatches (dump stores PLAIN json + DOUBLE-nests `<Scn>/<Scn>/<route>`;
 data.py wants GZIP `*.json.gz`/`results.json.gz` + immediate-subdir routes → it
@@ -290,3 +309,35 @@ negatives. Full build not yet run.
 - [x] Label generators: `--skip_first`/`--stride`, gz-aware, signal rule-scoring.
 - [ ] Switch VLM runners to the COMPACT prompt before the real label/compare run.
 - [ ] Run `sample_zoi_dataset.py` full build (~212 routes); then generate labels on it.
+
+## 17. Multi-model VLM comparison: InternVL 3.5 vs Gemma 3 vs Gemma 4 (all bf16)
+Goal: pick the best teacher VLM. Ran `run_vlm_multiframe.py` on 6 diverse frames (one per
+scenario, from `_preview_frames.json`) with the **compact** prompt (id+importance only) →
+zero parse failures. Results saved to **`/kaggle/working/zoi_preview_compare/`**
+(`multiframe_compare.md`, `multiframe_scores.json`, per-frame `*__<model>.json/.txt`, `*_marked.jpg`).
+
+Env/script changes:
+- `run_vlm_multiframe.py`: added `internvl` backend (`OpenGVLab/InternVL3_5-8B-HF`, native
+  transformers path, same code as gemma) + a `--prompt {compact,full}` flag (compact default,
+  avoids JSON truncation) + `COMPACT_PROMPT_TEMPLATE`. **All backends now full-precision bf16
+  for fairness** (gemma3 switched from the `-bnb-4bit` mirror to `unsloth/gemma-3-12b-it`;
+  the 12B bf16 models shard across both T4s via `device_map="auto"`).
+- **`transformers` upgraded 5.0.0 → 5.12.1**: gemma4's `gemma4_unified` arch is unrecognized
+  before 5.10 (`KeyError: 'gemma4_unified'`). InternVL3.5-HF + Gemma3 also load on 5.12.1.
+- `merge_compare.py` (NEW): rebuilds the combined `multiframe_{scores.json,compare.md}` from
+  the per-frame `*__<model>.json` files (used because gemma4 was re-run separately after the
+  transformers upgrade, and the crashed first pass never wrote the summary).
+
+Findings (6-frame screen, NO ground truth — directional, not final):
+- All three correctly rank pedestrians + close lead cars highest, far/off cars lowest (all
+  real teachers, unlike the flat Qwen baseline from §15).
+- **Gemma 3 = weakest:** narrowest range, COLLAPSED to flat 3.0 on all 7 cars in the
+  pedestrian frame. Drop it.
+- **Gemma 4 = best-calibrated gradient:** clean monotonic-by-distance, full 2→5 range,
+  reserves 5 for the closest/critical. But 12B bf16 (~24GB, both T4s; ideal on A100).
+- **InternVL 3.5 8B = best practical pick:** WIDEST relevant-vs-irrelevant contrast (uses 1
+  for far cars AND 5 for closest → strongest ZOI supervision signal), ~half the params,
+  fast (~12-22s/frame), clean parsing. Recommended for labeling thousands of frames on T4.
+- Recommendation: **InternVL 3.5 8B** for practicality, **Gemma 4** if compute allows; drop
+  Gemma 3. To settle rigorously: label a few hundred frames with the top-2 and compare, or
+  build a small gold set.
