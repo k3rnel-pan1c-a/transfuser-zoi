@@ -341,3 +341,115 @@ Findings (6-frame screen, NO ground truth — directional, not final):
 - Recommendation: **InternVL 3.5 8B** for practicality, **Gemma 4** if compute allows; drop
   Gemma 3. To settle rigorously: label a few hundred frames with the top-2 and compare, or
   build a small gold set.
+
+## 18. Prompt comparison on Gemma 4: compact vs exemplar vs egopathconflict (2026-06-28)
+New prompts live in `transfuser-zoi/zoi_prompts.py` (`EXEMPLAR_PROMPT`, `EGOPATHCONFLICT_PROMPT`);
+`run_vlm_multiframe.py` already supports `--prompt {compact,exemplar,egopathconflict,full}`,
+and `eval_prompts.py` scores a run dir by spread-std / depth-ρ (Spearman of score vs 1/depth) /
+top-1-closest / parse-fails. Ran Gemma 4 (`unsloth/gemma-4-12b-it`, bf16, sharded across 2×T4,
+transformers 5.12.1) on the 6 `_preview_frames.json` frames (37 objects). Output in
+**`/kaggle/working/prompt_eval_gemma4/{compact,exemplar,egopathconflict}/`**.
+
+| prompt | spread std | depth-ρ | range | top1 | parse_fail |
+|---|---|---|---|---|---|
+| compact | 1.59 | 0.66 | 0–5 | 0.33 | 0 |
+| **exemplar** | **1.61** | **0.86** | 1–5 | 0.33 | 0 |
+| egopathconflict | 1.10 | 0.64 | 1–5 | 0.33 | 0 |
+
+- **WINNER = exemplar.** Widest spread AND depth-ρ jumps 0.66→0.86 (per-score-level driving
+  anchors calibrate distance much better). Histogram is bimodal (clusters at 1 and 4) = sharp
+  relevant-vs-irrelevant contrast, the strong supervision signal the importance head wants.
+- **egopathconflict backfired:** the "potential conflict" framing made Gemma 4 hedge to the
+  middle (collapsed to 2–3–4, std 1.10). Drop it.
+- Caveat: 6 frames = directional (same as §17); to settle, label ~100–200 frames compact-vs-
+  exemplar and re-run `eval_prompts.py`. Also exemplar's floor is 1 (never 0) — fine since
+  importance=score/5 and the gate is sigmoid (relative order matters); tweak prompt if a true
+  0 floor is wanted for ParkedObstacle negatives.
+
+### 18a. Closed the cross: InternVL vs Gemma 4 on compact AND exemplar (same 6 frames)
+§17 only had InternVL-compact; §18 only had exemplar-on-Gemma4 → never apples-to-apples. Ran
+InternVL on both prompts too. Output in `/kaggle/working/prompt_eval_cmp/internvl_{compact,exemplar}/`.
+
+| teacher × prompt | spread std | depth-ρ | top1 | parse |
+|---|---|---|---|---|
+| Gemma 4 · compact | 1.59 | 0.66 | 0.33 | 0 |
+| **Gemma 4 · exemplar** | **1.61** | **0.86** | 0.33 | 0 |
+| InternVL · compact | 1.28 | 0.73 | 0.50 | 0 |
+| InternVL · exemplar | 1.16 | 0.48 | 0.50 | 0 |
+
+- **Gemma 4 + exemplar wins outright** — best spread AND best depth-ρ; beats InternVL's *best*
+  config (compact, 0.73) on both axes.
+- **Prompts are TEACHER-SPECIFIC: exemplar helps Gemma 4 but HURTS InternVL** (depth-ρ 0.73→0.48,
+  histogram herds 20/37 objects to "2"). Do not reuse one teacher's tuned prompt on another.
+- DECISION for the real labeling run: **Gemma 4 + exemplar** (A100 makes its speed penalty moot;
+  earlier §17 "InternVL for practicality" lean was compact-vs-compact, superseded once the prompt
+  is optimized). FALLBACK if forced onto T4: **InternVL + compact** — NEVER InternVL + exemplar.
+- Margin caveat: InternVL-exemplar collapse is robust; the 0.86-vs-0.73 gap is real but small-n
+  (37 objects). Bulletproof it with a ~100–200 frame labeled compare if needed, not blocking.
+
+### 18b. Production label generator `generate_zoi_labels_gemma4.py` (NEW, 2026-06-28)
+Built + smoke-tested on real Gemma 4 weights. Implements the §18a decision; the old generators
+are superseded (Qwen one = dropped teacher + verbose prompt; Gemma-3 one = dropped teacher AND
+is STALE — it marks signals (pre-§15 bug) and isn't gz-aware; do not use either for the real run).
+- Backend `AutoModelForImageTextToText` (loads gemma4_unified; Gemma-3 class can't), default
+  `unsloth/gemma-4-12b-it`, bf16 `device_map=auto`. `dtype=` kwarg confirmed on transformers 5.12.1.
+- Prompt `--prompt exemplar` (default; `egopathconflict`/`full` for ablation). Object lines INCLUDE
+  depth ("~12 m") to match how exemplar was evaluated in run_vlm_multiframe.
+- Signal-correct (shared zoi_projection): traffic_light/stop_sign scored by rule, NOT marked.
+- Training-parity selection: `--skip_first 10`, `--stride`. gz-aware. Output `[x,y,imp,class_id]`
+  .npy = drop-in for the data.py loader. Per-frame/route/total timing for budgeting.
+- Smoke test (2 frames, real weights): model load ~103s, VLM ~12.8s/frame on T4; produced a clean
+  graded label (car +15m→0.8, +30m→0.4, behind→0.0). Empty-frame → (0,4) array, loader handles it.
+- BUDGET DATA POINT: ~12.8s/frame VLM on T4 → ~5k frames ≈ 9 GPU-h (faster on A100). Matches §19.
+- Run: `python generate_zoi_labels_gemma4.py --root_dir <tree> --output_dir <writable> [--stride 5]`.
+  Prereq: point at the raw Kaggle dump OR run `sample_zoi_dataset.py` first (full build still pending).
+
+### 18c. Sampler<->labeler link + coverage guard (2026-06-28)
+The link between sample_zoi_dataset.py and the labeler was the `_manifest/*.txt` frame list,
+but the generators ignored it and re-derived frames via their own skip_first/stride glob (two
+independent selection paths -> silent drift; data.py treats a missing .npy as zero-supervision,
+no crash). Closed both ways:
+- `generate_zoi_labels_gemma4.py --manifest <out_root>/_manifest/train_labels.txt [eval_labels.txt]`
+  labels EXACTLY the sampler's frames (needs `--root_dir <out_root>`); skip_first/stride/route are
+  then ignored. Single source of truth = the manifest. Frames whose files aren't in the tree are
+  counted as MISSING in the summary, not silently skipped.
+- `verify_zoi_coverage.py --manifest ... [--labels_root <out_root>]` is the GATE: checks every
+  manifest frame has a well-formed `[M,4]` label (finite, importance in [0,1], class_id in {0,1,2,3});
+  M==0 valid but counted (zero-supervision frames). Exits 1 on <100% coverage or any malformed, so:
+  `python verify_zoi_coverage.py ... && torchrun ... train.py ...`. Tested on missing+malformed
+  fixtures (fails) and clean labels (passes).
+
+### 18d. transfuser.py ZOI grid wiring — VERIFIED by code read (no GPU needed)
+`zoi_src_stage=1` is correct for the default backbone: start_index=0 (regnety_032 has no extra stem
+return layer), loop i maps to feature_info stage i with reductions [4,8,16,32] -> at lidar_resolution
+256, i=1 = 32x32 (i=3 = the 8x8 bottleneck, matches sec 3). Grid captured at transfuser.py:184 AFTER
+fuse_features (so genuinely image+lidar fused, not raw lidar). `zoi_src_channels` (transfuser.py:104)
+indexes the SAME stage and fuse_features preserves channel count -> matches ZoiModule.input_proj by
+construction. Robust: a non-default backbone where i=1 != 32x32 won't crash (input_proj+flatten adapt),
+just different precision. Still TODO on server: one real use_zoi=True forward (shape-confirm end to
+end) + sensor_agent.py inference unpack.
+
+## 19. POC sizing — how much data to tell if ZOI works
+Binding constraint: the benefit is in the safety-critical LONG TAIL (collisions), not avg L2
+(§1/§10/§12), and rare events need the most data. Stage it; don't jump to closed-loop.
+
+| Stage | Question | Data | Verdict signal |
+|---|---|---|---|
+| 0 Teacher | VLM label discriminative & geometric? | 6–50 frames (DONE, §17/§18) | high spread, strong depth-ρ, no flat collapse |
+| 1 Learnability | Can ZOI head fit the labels? | ~1–1.5k frames (debug budget) | zoi_loss drops; pred imp correlates w/ held-out VLM labels (alignment IoU) |
+| 2 Open-loop | Any planning benefit vs control? | ~5k train + 1k eval | row4 > row3 on the safety-critical SUBSET even if avg L2 ties |
+| 3 Closed-loop | Drives better? | small CARLA route set, 2–3 seeds | score/collisions, row4 > row3 ≥ row1 |
+
+Minimum viable go/no-go POC:
+- **~5k labeled frames** (§16 budget, easily met), stride 5, skip_first 10, **Town13 held out**.
+- **Scenario mix > raw count:** bias hard to PedestrianCrossing/DynamicObjectCrossing/HighwayCutIn
+  + ParkedObstacle as the NEGATIVE case. Only ~10–30% of frames carry a safety-critical object —
+  that subset is what you measure on; cruising frames add ~no ZOI signal.
+- **Three arms always:** baseline (row1) / unsup-ZOI λ=0 (row3) / VLM-ZOI (row4), fine-tuned identically.
+- Closed-loop: ~20–40 critical routes/arm × 2–3 seeds = directional POC. Publishable collision-rate
+  claim needs ~50–100 critical routes/arm (rare Bernoulli events).
+- **NON-NEGOTIABLE: the verdict is row4 vs row3, NOT row4 vs row1** — extra params + extra
+  fine-tuning help regardless; comparing only to baseline manufactures a false positive (§12).
+  row4 ≈ row3 on the long tail = valid negative result (attention already learns relevance).
+- Cost driver is LABELING, not training: ~15s/frame → 5k frames ≈ 21 GPU-h/teacher on one T4
+  (→ teacher speed matters; A100 makes Gemma 4 viable).
