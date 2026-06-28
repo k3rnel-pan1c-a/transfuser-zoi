@@ -453,3 +453,66 @@ Minimum viable go/no-go POC:
   row4 ≈ row3 on the long tail = valid negative result (attention already learns relevance).
 - Cost driver is LABELING, not training: ~15s/frame → 5k frames ≈ 21 GPU-h/teacher on one T4
   (→ teacher speed matters; A100 makes Gemma 4 viable).
+
+## 20. Honest risk assessment + architecture/benchmark strategy (2026-06-28 discussion)
+Recorded because the binding question for this whole project is whether ZOI beats the λ=0 control,
+and the answer may well be "no". This section is the sober prior, the cheap go/no-go, and the
+architecture/benchmark options — so we don't sink the labeling+training budget on a blind bet.
+
+### 20.1 Why ZOI may NOT improve the model (well-founded skepticism)
+- **Redundancy with implicit attention (the core risk, §12).** The `join` decoder already cross-
+  attends over BEV tokens — attention IS learned relevance. ZOI adds explicit supervision for
+  something the architecture can already learn. If implicit attention captures most of it, ZOI =
+  extra params.
+- **Thin supervision channel.** The VLM transfers ONE scalar per GT box. Position is already exact
+  (GT). So ZOI's entire contribution is a relevance *ranking* — which the imitation target half-
+  teaches anyway (the expert braked for the pedestrian → planning loss already encodes "matters").
+- **Teacher is weak where it counts.** Even Gemma-4-exemplar's signal is mostly DISTANCE
+  (depth-ρ 0.86 = closer→higher), which the model already gets from geometry for free. The non-
+  trivial calls (far red light matters, close parked car doesn't) are where the VLM is noisiest.
+- **Auxiliary-attention supervision has a mixed-to-poor track record:** usually improves the PROXY
+  metric (attention alignment) without moving the TASK metric (driving score). carla_garage is the
+  "Hidden Biases" shortcut model — a relevance head doesn't remove the shortcut; the model can
+  satisfy zoi_loss AND keep cheating.
+- **Modal expected outcome:** row4 ≈ row3 on average metrics; maybe a small, noisy long-tail effect
+  hard to establish at ~5k frames. That is the §1 valid-negative-result branch. NOT worthless —
+  for a thesis/paper a CLEAN negative (made clean by the row3 control) is a real contribution; for
+  shipping a better driver it's a speculative bet with unfavorable odds. Goal determines value.
+
+### 20.2 Cheapest go/no-go: attention-correlation probe (DO THIS FIRST, no training)
+Take the RELEASED pretrained model, run on a few hundred frames, extract the planner attention over
+BEV tokens (model already has `TransformerDecoderWithAttention` / `tp_attention`), correlate per-
+object attention mass with the VLM importance labels.
+- Attention ALREADY correlates strongly with VLM relevance → model already knows it → ZOI likely
+  redundant → STRONG kill signal; saves ~9–21 GPU-h labeling + all training. Architecture-independent.
+- Attention does NOT correlate → genuine headroom → proceed.
+- Caveat: not 100% definitive (no-correlation doesn't guarantee ZOI helps), but strong correlation
+  is a strong negative. Highest info-per-hour test available. Reuses existing projection/label code.
+
+### 20.3 Does a different architecture change the odds?
+- **No, not by itself.** The redundancy-with-implicit-attention risk follows you to ANY attention
+  planner (VAD, UniAD, PARA-Drive, PlanT, NAVSIM TF). The control (row4 vs row3) is the real test
+  regardless of base model. "Try another architecture" = same bet, different shirt.
+- **The axis that DOES matter: explicit object tokens vs feature soup.**
+  - TransFuser++ (current): relevance is diffuse (8×8 grid + attention); ZOI tokens are bolted on and
+    the planner must LEARN to use them — weakest fit, easiest to ignore.
+  - Object-token planners (**PlanT — already in-repo, privileged, takes GT boxes as input**; or
+    VAD/UniAD): relevance attaches DIRECTLY to an existing per-object query as an aux head; attention
+    is per-object interpretable so you can measure if supervision changed it. Cleaner MECHANISM, but
+    they still have planning attention → control risk remains (cleaner, not better odds).
+- **The bigger lever is the BENCHMARK, not the architecture.** Worry = "will it improve the model?" →
+  fastest answer = more cheap shots on goal = eval cost:
+  - carla_garage = closed-loop CARLA: expensive, slow, noisy, simulator-bound, shortcut-learner →
+    one hard-to-read bet.
+  - **NAVSIM (open-loop PDMS): no simulator, standardized metric, fast train+eval, current hot
+    benchmark** (§2 already lists it as a generality experiment). Same ZOI idea on NAVSIM lets you
+    test 2 architectures cheaply instead of staking it all on one closed-loop run.
+
+### 20.4 Recommended order
+1. Run the §20.2 attention probe FIRST (architecture-independent, hours, no training).
+2. If switching, switch architecture AND cheap-eval together: PlanT or a NAVSIM transformer planner
+   (clean aux head + fast iteration).
+3. Keep the λ=0 control no matter what — it IS the experiment.
+4. OPEN QUESTION that changes everything: goal = thesis/paper (clean cross-arch result, even
+   negative, is valuable + achievable on NAVSIM) vs working better driver (be more skeptical of the
+   whole line regardless of architecture). Decide this before spending the budget.
