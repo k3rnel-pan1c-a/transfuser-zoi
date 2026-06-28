@@ -181,6 +181,53 @@ def discover_routes(args):
     return sorted({str(Path(p).parents[1]) for p in box_glob})
 
 
+def resolve_boxes(route_dir, stem):
+    """Return the existing boxes path for a frame (.json.gz in the built tree,
+    plain .json in the raw dump), or None."""
+    for ext in (".json.gz", ".json"):
+        p = os.path.join(route_dir, "boxes", stem + ext)
+        if os.path.isfile(p):
+            return p
+    return None
+
+
+def route_stems_from_walk(route_dir, skip_first, stride):
+    """Frames in a route selected by the SAME rule training uses (skip_first + stride)."""
+    box_files = sorted(glob.glob(os.path.join(route_dir, "boxes", "*.json")) +
+                       glob.glob(os.path.join(route_dir, "boxes", "*.json.gz")))
+    stems = []
+    for bf in box_files:
+        stem = os.path.basename(bf).split(".")[0]
+        if stem.isdigit():
+            fi = int(stem)
+            if fi < skip_first or fi % stride != 0:
+                continue
+        stems.append(stem)
+    return stems
+
+
+def build_worklist(args):
+    """Ordered [(route_dir, [stems])]. When --manifest is given, the frame list comes
+    STRAIGHT from the sampler's manifest (single source of truth -> no skip_first/stride
+    drift between sampling, labeling, and training). Otherwise frames are re-derived by
+    walking each route with --skip_first/--stride (must be set to match training)."""
+    if args.manifest:
+        from collections import OrderedDict
+        routes = OrderedDict()
+        for mpath in args.manifest:
+            with open(mpath) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    route_rel, stem = line.rsplit(" ", 1)   # "<scn>/<route> <stem>"
+                    rd = os.path.join(args.root_dir, route_rel)
+                    routes.setdefault(rd, []).append(stem)
+        return list(routes.items())
+    return [(rd, route_stems_from_walk(rd, args.skip_first, args.stride))
+            for rd in discover_routes(args)]
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--root_dir", help="dataset root (contains route folders)")
@@ -190,6 +237,10 @@ def main():
     ap.add_argument("--output_dir", default=None,
                     help="mirror each route's path (relative to --root_dir) under this writable "
                          "dir instead of writing inside the route folder (use for read-only inputs)")
+    ap.add_argument("--manifest", nargs="+", default=None,
+                    help="one or more _manifest/*.txt from sample_zoi_dataset.py. Labels EXACTLY "
+                         "those frames (single source of truth; ignores --skip_first/--stride/--route). "
+                         "Needs --root_dir = the built tree the manifest paths are relative to.")
     ap.add_argument("--model", default=DEFAULT_MODEL)
     ap.add_argument("--prompt", choices=list(PROMPTS), default="exemplar",
                     help="exemplar = chosen default (sec 18a); egopathconflict/full = ablation rows")
@@ -204,27 +255,30 @@ def main():
                     help="generation cap; compact JSON output needs few tokens")
     args = ap.parse_args()
 
-    if not args.route and not args.root_dir:
-        ap.error("provide --route (single route) or --root_dir (all routes)")
+    if not args.route and not args.root_dir and not args.manifest:
+        ap.error("provide --manifest, --route (single route), or --root_dir (all routes)")
+    if args.manifest and not args.root_dir:
+        ap.error("--manifest needs --root_dir (the built tree the manifest paths are relative to)")
     if args.route and args.output_dir and not args.root_dir:
         ap.error("--output_dir needs --root_dir to compute the relative mirror path")
 
     prompt_template = PROMPTS[args.prompt]
+    worklist = build_worklist(args)
+    n_frames = sum(len(s) for _, s in worklist)
+    src = "manifest" if args.manifest else "walk(skip_first/stride)"
+    print(f"frame source: {src} -> {len(worklist)} routes, {n_frames} frames selected")
+
     print(f"loading {args.model} (prompt={args.prompt}) ...")
     t_load0 = time.perf_counter()
     model, processor = load_model(args.model)
     print(f"model loaded in {time.perf_counter() - t_load0:.1f}s")
 
-    routes = discover_routes(args)
-    print(f"found {len(routes)} route folder(s)")
-
     done = 0
+    missing = 0
     all_gen_times = []
     run_t0 = time.perf_counter()
 
-    for route in routes:
-        box_files = sorted(glob.glob(os.path.join(route, "boxes", "*.json")) +
-                           glob.glob(os.path.join(route, "boxes", "*.json.gz")))
+    for route, stems in worklist:
         if args.output_dir:
             base = args.root_dir or os.path.dirname(route)
             route_rel = os.path.relpath(route, base)
@@ -236,15 +290,11 @@ def main():
         route_t0 = time.perf_counter()
         route_frames = 0
         route_gen_times = []
-        for bf in box_files:
-            stem = os.path.basename(bf).split(".")[0]      # 0010.json / 0010.json.gz -> 0010
-            # mirror training's frame selection: drop warm-up + temporal subsample
-            if stem.isdigit():
-                fi = int(stem)
-                if fi < args.skip_first or fi % args.stride != 0:
-                    continue
+        for stem in stems:
+            bf = resolve_boxes(route, stem)
             rgb = os.path.join(route, "rgb", stem + ".jpg")
-            if not os.path.isfile(rgb):
+            if bf is None or not os.path.isfile(rgb):
+                missing += 1                 # manifest frame whose files aren't in the tree
                 continue
             dbg = args.debug_dir if (args.debug_dir and done < args.debug_n) else None
             tgt, gen_s = process_frame(rgb, bf, model, processor, prompt_template,
@@ -276,8 +326,10 @@ def main():
     total_wall = time.perf_counter() - run_t0
     print("\n================ SUMMARY ================")
     print(f"teacher / prompt     : {args.model} / {args.prompt}")
-    print(f"routes               : {len(routes)}")
+    print(f"routes               : {len(worklist)}")
     print(f"frames labeled       : {done}")
+    if missing:
+        print(f"frames MISSING       : {missing}  (selected but rgb/boxes not found in the tree)")
     print(f"total wall time      : {total_wall:.1f}s ({total_wall/60:.2f} min)")
     if done:
         print(f"avg per-frame (wall) : {total_wall/done:.2f}s => {done/total_wall*60:.1f} frames/min")
