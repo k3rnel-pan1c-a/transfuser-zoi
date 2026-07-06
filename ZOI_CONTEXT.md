@@ -516,3 +516,374 @@ object attention mass with the VLM importance labels.
 4. OPEN QUESTION that changes everything: goal = thesis/paper (clean cross-arch result, even
    negative, is valuable + achievable on NAVSIM) vs working better driver (be more skeptical of the
    whole line regardless of architecture). Decide this before spending the budget.
+
+## 21. Go/no-go probes RUN on Kaggle (2026-06-29) — residual + attention, both implemented
+Executed the §20 cheap go/no-go tests BEFORE committing the labeling/training budget. Two new
+self-contained scripts in `transfuser-zoi/`; artifacts under `/kaggle/working/zoi_probe*`.
+
+### 21.1 Environment deltas (needed to re-run; some contradict earlier notes)
+- **`pip install carla` WORKS on this Python.** Kaggle is py3.12; PyPI has a `carla==0.9.16`
+  cp312 manylinux wheel (34 MB). The §5/sandbox assumption "carla not installable" is FALSE here —
+  no stub needed for the import itself. (transfuser_utils only uses carla.Vector3D/Location in
+  geometry helpers off the preprocessing path anyway.)
+- `pip install "laspy[lazrs]"` (lidar .laz), `transformers==5.12.1` (env shipped 5.0.0 → gemma4
+  `KeyError: gemma4_unified`; matches §17). `timm` is independent of the transformers bump.
+- Pretrained TF++ weights downloaded: `models/pretrained/pretrained_models/{all_towns,
+  town13_withheld}/model_0030_{0,1,2}.pth` (+ config.json/args.txt). Used **town13_withheld**
+  (matches the held-out-Town13 eval plan). config has tp_attention=0, seq_len=1, use_ground_plane=0
+  (lidar=1 channel), transformer_decoder_join=1, gru_input_size=256.
+
+### 21.2 Probe #1 — `analyze_importance_residual.py` (is importance just distance?)
+Regress importance on closeness 1/(1+r) AND a behind flag; the leftover variance = what the VLM
+adds beyond free geometry. **Filters to VLM-scored classes car=0/walker=1** (traffic_light=2/
+stop_sign=3 carry deterministic rule_importance, NOT VLM judgment — excluding them isolates the
+test; this class filter was added after a good catch and applies to BOTH probes).
+Results (objects, residual = 1 - R^2 of geometry):
+- Gemma-4 labels (`zoi_labels_gemma_fast/_test`, ~100-130 obj): **~44-51% residual** → real
+  non-distance signal; within-distance-bin importance std ~0.27 (equal-geometry disambiguation).
+- Old flat-Qwen `zoi_labels` (1097 obj): only 18% residual; `behind` flag alone explains 82% →
+  degenerate teacher (confirms §15 "flat Qwen"). DO NOT use these labels.
+- Caveat: necessary-not-sufficient. Big residual could be VLM noise; probe #2 distinguishes
+  signal-residual from noise (does attention already track it?).
+
+### 21.3 Probe #2 — `attention_probe.py` (does the planner ALREADY attend to VLM-important objects?)
+Runs the RELEASED TF++ on real frames, reads planner cross-attention over the 64 BEV tokens,
+correlates per-object attention with VLM importance. **Decisive metric = attention-RESIDUAL vs
+importance-RESIDUAL** (both after removing distance), NOT raw corr (both rise with closeness).
+Harness recipe (expensive to re-derive — all VERIFIED working on a real forward pass):
+- model.py → nav_planner imports `agents.navigation` (CARLA leaderboard control) and data.py
+  imports `imgaug` (broken on numpy 2.0) — BOTH stubbed in `_install_stubs()` (neither is on the
+  fwd/preprocess path). carla itself is real (pip).
+- Preprocessing reused VERBATIM from `CARLA_Data` via `__new__` (skip the heavy dataset-scanning
+  __init__, just attach `.config`) → `lidar_to_histogram_features`, `align` (identity at seq_len=1),
+  match training exactly. Inputs: rgb=cv2 BGR→RGB float 0-255 (backbone normalize_imagenet /255),
+  lidar=laspy.xyz→hist, target_point/speed/command(one-hot) from measurements json.
+- Attention "by HOOK not by FLAG": keep tp_attention=0 (so released weights load strict),
+  monkeypatch `model.join.layers[-1].multihead_attn` to force need_weights=True and stash weights.
+  attn shape [B,11,65]=11 planner queries × (64 BEV + 1 sensor token; NO tp token at tp_attention=0).
+  Take attn[:, :64].mean(query)→8×8 grid.
+- `xy_to_cell`: ego (x=front,y=right) m → 8×8 cell (±32m, 8m/cell), col=x row=y, token=row*8+col.
+  Orientation **VALIDATED** via debug overlays (`zoi_probe/debug/*_attn.jpg`, JET heatmap + dots) and
+  camera|BEV side-by-sides (`make_sidebyside.py` → `zoi_probe/sidebyside/`): behind-car→left edge/blue,
+  far-lateral→corner/blue, front-pedestrian→center near red peak. Correct.
+- PRELIMINARY result (PedestrianCrossing only, basically ONE route, 179 car/walker objects):
+  att-vs-importance raw Pearson +0.43; att-vs-closeness +0.43/Spearman +0.53; **att-resid vs
+  imp-resid Pearson +0.24, Spearman -0.02**. → attention tracks DISTANCE/path, only weakly the VLM's
+  per-object relevance residual → tentative HEADROOM for ZOI ("proceed" lean). FRAGILE: one route,
+  Pearson/Spearman disagree (few-point-driven), 8m cells blur objects. NOT a verdict.
+
+### 21.4 Curated probe label set (the real run)
+`generate_zoi_labels_gemma4.py` (gemma-4-12b-it, exemplar, shards across 2×T4 ~12GB each, ~13s/frame)
+on a balanced mix → `/kaggle/working/zoi_probe_labels/<Scenario>/<route>/zoi_labels/*.npy`:
+PedestrianCrossing (stride10) + DynamicObjectCrossing/HighwayCutIn/ParkedObstacleTwoWays(NEG)/
+SignalizedJunctionLeftTurn (stride25 for route/town diversity), 40 frames each = ~200 frames.
+TODO (immediate): on completion run `attention_probe.py --labels_root zoi_probe_labels` POOLED for the
+real residual-corr number; re-run `analyze_importance_residual.py` on the same set (now class-filtered).
+Then DECIDE per §20.4: strong att-resid↔imp-resid corr = kill; weak = proceed to Stage-1 learnability.
+
+### 21.5 POOLED probe result (all 5 scenarios, 198 frames, 819 car/walker objects)
+`attention_probe.py --labels_root zoi_probe_labels`:
+- att vs importance (raw): Pearson +0.36 / Spearman +0.38
+- att vs closeness 1/(1+r): Pearson +0.40 / Spearman +0.53
+- **att-resid vs imp-resid (THE TEST): Pearson +0.23 / Spearman +0.24** (now AGREE → stable, unlike the
+  one-route +0.24/-0.02). Reading: attention dominated by geometry/path; only ~5% of variance (R^2≈0.05)
+  of the VLM's non-distance relevance is captured → NOT the redundancy kill-signal → soft "proceed".
+- **BUT this number is computed on CONTAMINATED labels — see §22. Re-run after the label fix before trusting it.**
+
+## 22. CRITICAL label-quality bug found (2026-06-29) — silent-zero + dark-image omission + lossy depth
+User inspection of `subtle_examples.py` renders caught nonsense labels (a braking in-lane lead car scored
+0.0; a far off-axis car scored higher than a close in-lane one). Root-caused with `diag_frame.py`/`diag_show.py`
+(re-run Gemma 4 on the offending frames, printing the marked input + exact prompt + RAW output). Findings:
+
+### 22.1 The silent-zero bug (most serious)
+`generate_zoi_labels_gemma4.py process_frame`: `targets=np.zeros((n,4))`; importance is ONLY overwritten when the
+VLM returns a score for that mark id (`for s in parsed["scores"]: targets[id_to_row[oid],2]=imp/5`). **A marked
+object the VLM OMITS from its answer stays 0.0 — indistinguishable from a real "irrelevant".** So a `0.0`
+car/walker label means one of: VLM judged irrelevant / VLM forgot the id / projected off-image. The VLM
+demonstrably omits ids (and here dropped the SINGLE most relevant object). Prompt is NOT the cause — exemplar
+says "For EACH numbered marker..." + "Score every id listed." VLMs are text generators, not form-fillers; "cover
+all ids" is a soft constraint they violate at some rate. → false "irrelevant" labels contaminate BOTH probes
+(the §21.5 +0.23 included these) and would actively harm training ("ignore the car you're braking for").
+
+### 22.2 PROVEN cause for the example + cheap fix: image was too DARK
+Frame `DynamicObjectCrossing/Town01_Rep0_Town01_Scenario3_5_route0_.../0125`: marks id0=lead car @~13m (in lane,
+brake lights), id1=far car @~23m. A/B with `diag_show.py` (SAME prompt, SAME marks, only brightness differs):
+- DARK input (what pipeline feeds): `{"scores":[{"id":1,"importance":1}]}` → id0 MISSING → silent 0.0 (the bug).
+- BRIGHTENED input (alpha 2.6,beta 30): `{"scores":[{"id":0,"importance":4},{"id":1,"importance":1}]}` → id0=0.8
+  (CORRECT, matches the 5/6 sibling routes that scored this lead car 0.8-1.0), id1=0.2.
+→ Darkness made Gemma unable to see/parse the lead car. Many CARLA frames are night/dusk/rain (weather aug), so
+exposure-normalizing the VLM INPUT image likely recovers a large share of dropped objects FOR FREE. (Verified
+artifact: `zoi_probe/diag/0125_EVERYTHING.jpg` = verbatim exemplar prompt + dark vs bright inputs + both outputs.)
+
+### 22.3 Lossy object description: depth is forward-distance-only, NO lateral/lane info
+`zoi_projection.project_ego_to_image` returns `depth = cam[2] = x + 1.5` (longitudinal dist from camera, camera
+at CAMERA_POS x=-1.5), NOT the radial range. The object line is just `a {class} at ~{depth}m`. So for an off-axis
+object (0125 id1 ego=(21.6, 21.6)): told "~23 m", actually ~30 m away AND 21 m to the right (other lane). The
+exemplar prompt says "Lane position is the PRIMARY signal" yet the VLM is given ZERO lateral/lane data — must infer
+lane from the dot's pixel position alone. Object positions x,y,z ARE exact GT in the dataset (`boxes/XXXX.json`
+`b["position"]=[x_fwd,y_right,z_up]`), so richer lines cost nothing: e.g. `a car 22 m ahead, 22 m to the right
+(~30 m, NOT ego lane)`.
+
+### 22.4 THE FIX (fold all three into the labeler before any re-label / re-probe)
+1. **Brighten/exposure-normalize the VLM input image** (auto-gamma/CLAHE or simple alpha/beta). Proven to recover ids.
+2. **Completeness guard — never silent-default to 0.** Track returned-vs-marked ids; for any missing id RETRY
+   (re-prompt with just the missing ids), then mark any STILL-missing as INVALID (validity mask / NaN), excluded
+   from supervision AND from the probe. Also log the omission rate (currently unmeasured).
+3. **Richer object lines**: longitudinal + lateral offset (or lane) + true radial range — give the VLM the lane
+   signal the prompt says is primary.
+Bigger teacher (Qwen2.5-VL-72B / InternVL3-38/78B / Molmo-72B) is an option for scene understanding but needs
+A100-80GB and WON'T guarantee completeness — the validity guard is needed regardless. Try brighten+guard+richer
+FIRST (cheap) before swapping teachers.
+
+### 22.5 Status / immediate next steps
+- New files this session (all in `transfuser-zoi/`): `attention_probe.py`, `analyze_importance_residual.py`,
+  `make_sidebyside.py`, `subtle_examples.py`, `diag_frame.py`, `diag_show.py`. Artifacts under `/kaggle/working/zoi_probe/`
+  (`debug/` attn overlays, `sidebyside/`, `subtle/` the mined examples, `diag/` the bug evidence inc. 0125_EVERYTHING.jpg).
+- Probe labels at `/kaggle/working/zoi_probe_labels/<Scenario>/<route>/zoi_labels/*.npy` (200 frames) are
+  CONTAMINATED by §22.1 → DO NOT trust §21.5 (+0.23) until re-labeled with the §22.4 fixes.
+- TODO: (1) implement §22.4 in the labeler; (2) re-label the 200 frames + report omission rate; (3) re-run
+  `attention_probe.py` on the clean labels for the real go/no-go number; (4) then decide per §20.4.
+
+## 23. Teacher upgrade, richer distillation, and paper positioning (2026-07-06 session)
+Strategy review session (no code changes). Three outcomes: new teacher candidates (the "NVIDIA one"
+the prof mentioned), a plan to widen the supervision channel with reasoning traces, and — critically —
+a prior-art finding that changes how the paper must be framed.
+
+### 23.1 NVIDIA teacher candidates (prof's suggestion — verified July 2026)
+- **Cosmos-Reason2** (released 2025-12-19; 2B/8B/32B on HF under `nvidia/Cosmos-Reason2-*`): open
+  reasoning VLM for physical AI, #1 open model on Physical AI Bench. Post-trained heavily on driving
+  VQA. Natively supports 2D/3D point localization, bounding boxes, trajectories; **video-native**
+  (256K ctx). The 8B is in the same T4-friendly class as InternVL 3.5 8B → no A100 dependency.
+  **ACTION: run Cosmos-Reason2-8B through the existing bake-off harness** (`run_vlm_multiframe.py`
+  + `eval_prompts.py` spread/depth-ρ, then §21.2 residual probe) vs Gemma-4-exemplar. Prompts are
+  teacher-specific (§18a) → tune fresh, don't reuse exemplar verbatim. Being a reasoning model it
+  emits long CoT before the answer → enforce structured final-answer format + generous max tokens
+  or the §15 truncation-parse failures return.
+- **Alpamayo-R1-10B** (`nvidia/Alpamayo-R1-10B`, arXiv 2511.00088): driving VLA built ON
+  Cosmos-Reason; autoregressively generates "Chain-of-Causation" reasoning traces + trajectory
+  tokens, targeted at the long tail. NOT a practical teacher for us (expects 4-camera real-world
+  rig, 10 Hz history — domain mismatch with single-front-cam CARLA) but is DIRECT evidence that
+  reasoning-trace training improves long-tail action prediction → cite as motivation/related work.
+
+### 23.2 Reasoning-trace supervision — 3 tiers (answers the §20.1 thin-channel critique)
+The scalar transfers a few bits/frame at ~13 s/frame of VLM compute, and ~50% of it is distance
+(§21.2). Widen the channel, in order of robustness-per-effort:
+- **Tier 1 — structured per-object fields (do regardless):** teacher also emits discrete tags per
+  object: `crosses_ego_path: yes/no/maybe`, `suggested_ego_response: brake/yield/ignore/monitor`,
+  `time_criticality: now/soon/none`. Supervise small classification heads on the matched ZOI
+  queries. Cheap to parse/verify; carries the CAUSAL info the scalar doesn't ("matters because it
+  will enter my path" vs "matters because it's close").
+- **Tier 2 — rationale-embedding distillation (the VLM-AD/DiMA mechanism):** teacher writes a
+  one-sentence per-object rationale; embed with a FROZEN text encoder (SigLIP/CLIP text tower or
+  sentence-transformer); small projection head on each matched query, cosine loss vs embedding.
+  Do NOT put a text-generation head on the module — wrong weight class; embedding regression is
+  how VLM-AD gets gains with zero inference cost. Scene-level variant (one rationale → one scene
+  token) is the cheaper starting point.
+- **Tier 3 — temporal labels:** Cosmos-Reason2 is video-native; a short clip lets the teacher see
+  INTENT (pedestrian accelerating toward curb vs standing) — the thing single-frame importance
+  cannot encode, and where the long-tail benefit plausibly lives. = ablation row 7, now feasible.
+- Every tier adds parse-failure surface → the §22.4 completeness guard generalizes: any object
+  whose structured fields fail to parse gets validity-masked, NEVER a silent default.
+
+### 23.3 Distillation recipe (ordered)
+1. **§22.4 fixes FIRST** (brighten, retry-then-invalidate, richer object lines) — prerequisite to
+   everything; then re-run the attention probe on clean labels (the real go/no-go gate stands).
+2. **Teacher bake-off:** Cosmos-Reason2-8B vs Gemma-4-exemplar, per-teacher tuned prompts, decided
+   on non-distance residual + spread. Add **self-consistency**: sample teacher 3× at temp>0,
+   average scores, use variance as per-label confidence weight (mitigates omissions AND noise).
+3. **Importance loss → pairwise ranking + down-weighted BCE.** Absolute VLM calibration is the
+   teacher's weakest property (§17/§18 score-scale swings); within-frame relative order is robust.
+   Keep some BCE so the sigmoid gate in `token * (1+sigmoid(imp))` stays calibrated.
+4. **Widen the channel:** Tier-1 tags now, Tier-2 rationale embeddings as the headline addition.
+5. **Extend the ablation table:** importance-only / +tags / +rationale-embedding, all vs the λ=0
+   control — shows WHICH part of the distillation carries the gain (the scientific payoff).
+6. If Stage-1/2 shows signal → Tier-3 temporal labels.
+Richer supervision does NOT change the odds that explicit relevance beats implicit attention — it
+changes the effect size IF there is one, and makes a negative result more informative.
+
+### 23.4 Prior art / novelty — CRITICAL for the paper framing
+- **RSD — "Risk Semantic Distillation from VLM" (arXiv 2511.14499, Nov 2025) is the closest prior
+  work:** Qwen2.5-VL produces per-object risk scores+rankings, distilled via an aux "RiskHead" on
+  BEV features into VAD, no VLM at inference, evaluated closed-loop on Bench2Drive long-tail.
+  Verified by reading the paper: **they run NO unsupervised control** (no same-head-no-VLM arm; only
+  VAD vs VAD+RSD) — exactly the §19 "manufactured false positive" confound.
+- **VLM-AD (arXiv 2412.14446):** scene-level freeform reasoning text + structured action labels as
+  aux supervision on UniAD/VAD/SparseDrive; gains on nuScenes + CARLA Town05; also no λ=0-style
+  control. **DiMA:** MLLM→vision-planner feature distillation. **Alpamayo-R1:** reasoning traces
+  inside a full VLA (different mechanism; cite).
+- CONSEQUENCE: the claim "we distill VLM relevance into an e2e driver with no inference cost" is
+  **occupied territory** (twice). "Our method" framing will not survive review.
+- **The distinct, defensible axes (in order of strength):**
+  1. **The controlled question as the headline:** "Does VLM relevance supervision teach an e2e
+     planner anything its attention doesn't already learn?" — λ=0 control + random-token control +
+     fair-baseline rule + attention probe = the contribution. Robust to outcome: row4>row3 is a
+     positive nobody cleanly established; row4≈row3 is a clean negative that challenges RSD/VLM-AD's
+     implied mechanism.
+  2. **Supervision-as-input vs supervision-as-regularizer:** RSD = aux head on BEV features (pure
+     loss-side); ours = tokens INJECTED into planner memory, consumed at inference. Nobody has
+     isolated this axis → **add ablation row: ZOI supervision through aux head only (no token
+     concat) vs full token injection.**
+  3. **Which supervision content carries the gain** (§23.3 step 5) — VLM-AD/RSD each pick one
+     format, never compare. Object-grounded rationale embeddings specifically are an open slot
+     (VLM-AD text is scene-level; RSD is scalar+rank).
+- Thesis bar: comfortably cleared (controlled study, honest negatives OK). Conference bar: cleared
+  ONLY with the analysis framing; cite RSD + VLM-AD prominently as the methods the controls
+  interrogate.
+- **Benchmark note:** RSD used Bench2Drive → sharing a benchmark (Bench2Drive or NAVSIM, §20.3)
+  for at least one table makes the comparison legible rather than asserted.
+
+### 23.5 TODO delta from this session
+- [ ] §22.4 label fixes (unchanged, still first).
+- [ ] Add Cosmos-Reason2-8B backend to `run_vlm_multiframe.py` / labeler; bake off vs Gemma-4.
+- [ ] Ranking+BCE importance loss; self-consistency sampling + confidence weights in the labeler.
+- [ ] Tier-1 structured tags in prompt+parser+labels (extend .npy schema or sidecar); Tier-2
+      rationale text + frozen-encoder embeddings; heads on ZoiModule for both.
+- [ ] New ablation rows: aux-head-only (no token concat); importance-only vs +tags vs +rationale.
+- [ ] Related-work pass: RSD (2511.14499), VLM-AD (2412.14446), DiMA, Alpamayo-R1 (2511.00088).
+- NOTE: §23.5 is superseded by the §24 master plan (same items, now sequenced + extended).
+
+## 24. MASTER PLAN (2026-07-06): architecture upgrades + labeling budget + phased execution
+Consolidates §22-§23 + the architecture review of `zoi_module.py` into one sequenced plan.
+User confirmed MORE LABELING BUDGET is available — but scale AFTER quality+schema are fixed, not before.
+
+### 24.1 Architecture verdict on ZoiModule (reviewed 2026-07-06)
+KEEP the DETR-style module (right substrate for §23.2 per-object tag/rationale heads; sees the
+genuine 32×32 mid-stage, unlike CenterNet's detail-free 64×64 — §3). But 4 trainability upgrades,
+motivated by: **set-prediction from scratch on ~5k frames with a FROZEN backbone is the biggest
+training risk.** Plain-language why: the loss must Hungarian-pair 20 unordered outputs with M
+labels every step; with random init the pairing flickers (pedestrian graded against slot 7 one
+step, slot 12 the next) → queries get contradictory gradients → DETR's infamous slow convergence
+(~500 epochs on 118k COCO images). Frozen backbone makes it worse: features never adapt to meet
+the queries halfway, the from-scratch module does 100% of the accommodating.
+1. **Anchor queries (DAB-style "home addresses").** Each query gets a learnable (x,y) reference
+   point; its positional part = `ContinuousPositionEmbedding(ref_xy)` (class already exists);
+   `predict_xy` outputs a DELTA from the reference, not an absolute position. Objects then match
+   consistently to the nearest-home query → assignment stops flickering from step 0.
+2. **Denoising queries (DN-style "training wheels") — nearly free HERE because label xy is exact
+   CARLA GT.** Train-time only: append extra queries built from jiggled GT positions, graded
+   against their source object BY CONSTRUCTION (no Hungarian). Clean gradients train the SHARED
+   decoder + xy/importance heads while learned queries sort out territories. Two masks keep it
+   honest: DN queries NEVER enter the planner concat (GT leak) and don't exist at inference
+   (parity §4 untouched).
+3. **Zero-init injection gate.** `model.py:342` currently concats RANDOM tokens into a PRETRAINED
+   planner's memory at step 0 → perturbs it before ZOI knows anything, muddies the fair baseline.
+   Fix: learnable scalar gate (init 0, Flamingo/LayerScale style) on `zoi_tokens` → at step 0 the
+   model IS exactly the pretrained baseline; planner opens the gate as tokens become useful.
+4. **Gating range [1,2] → [0,1].** `token * (1+sigmoid(imp))` (`zoi_module.py:114`) never
+   suppresses: an "irrelevant" query still injects at full 1× (≈15 junk tokens/frame at N=20,
+   M~2-8). Switch to plain `sigmoid(imp)` so learned irrelevance attenuates; dead-gradient worry
+   is covered by the direct zoi_loss path into the importance head. Keep [1,2] as ablation note.
+Minor: `norm_first=True` on the decoder layers (pre-norm, stabler small-scale); optionally
+restrict each anchor query's cross-attn to a local neighborhood of its reference.
+NOT doing: Flavor 1A/CenterNet-head reuse (worse features), content-free tokens as main design
+(ablation row only), fancier planner interfaces (§20.3 — risk is redundancy, not bandwidth).
+FALLBACK if Hungarian training still unstable after 1+2: dense importance heatmap on the 32×32
+(CenterNet Gaussian+focal, machinery in-repo), top-K cells + offset head → tokens. Converges
+reliably on small data but per-object rationale/tag heads attach less naturally.
+
+### 24.2 Does more data help, and what to label (user has budget)
+More frames help EXACTLY here: (a) Stage-2 verdict power — the measured subset is the ~10-30%
+safety-critical frames, so 5k frames ≈ only ~0.5-1.5k critical frames; scaling to 10-15k roughly
+triples the frames the verdict is computed on; (b) within-frame pairs for the ranking loss;
+(c) walker/rare-event coverage. More data does NOT fix teacher noise (self-consistency does) or
+the redundancy risk (only the λ=0 control answers that). Supply is not binding: ~1,213 trainable
+routes in the Kaggle dump (§16) >> 15k frames at stride 5.
+**SEQUENCING RULE: do not burn the big run early.** One VLM call can return score+tags+rationale
+together, so the marginal cost of the §23.2 rich schema is ~zero — but only if the schema exists
+BEFORE the big run. Big labeling waits for Phase 2.
+Three label products:
+- **P1 gold eval set (~300-500 frames):** best teacher available (Gemma-4 or Cosmos-Reason2-32B
+  on A100), 3× self-consistency, human spot-check ~100 frames. Uses: alignment-IoU eval,
+  teacher-comparison ground truth (kills the recurring small-n caveat, §17/§18a), label-noise est.
+- **P2 main train set (~10-15k frames, up from 5k):** winning teacher, rich schema, completeness
+  guard; 2-3× self-consistency if A100 (else 1× + retry-on-omission on T4). Mix biased hard to
+  PedestrianCrossing/DynamicObjectCrossing/HighwayCutIn + ParkedObstacleTwoWays negatives +
+  SignalizedJunctionLeftTurn; small noScenarios share. Town13 held out (unchanged).
+- **P3 teacher-compare set (~150-200 frames):** both finalist teachers on identical frames,
+  scored against P1 gold → picks the P2 teacher rigorously.
+Budget math @T4 ~13s/frame/pass: P2@10k×1 ≈ 36 GPU-h; ×3 ≈ 108 GPU-h (~4.5 T4-days; A100 ~3-4×
+faster). If forced to choose: frames > passes for P2 (ranking loss tolerates noise), passes >
+frames for P1 (it's the measuring stick).
+
+### 24.3 Phased execution plan (each phase gates the next)
+**Phase 0 — label quality + teacher choice (blocks everything).**
+0a. Implement §22.4 in labeler: exposure-normalize, completeness guard (retry→invalidate,
+    log omission rate), richer object lines (longitudinal+lateral+radial).
+0b. Add Cosmos-Reason2-8B backend (§23.1); tune its prompt fresh (§18a rule); structured
+    final-answer format + generous max tokens (CoT model).
+0c. Re-label the 200 probe frames (both finalists) → P3; re-run `attention_probe.py` +
+    `analyze_importance_residual.py` on CLEAN labels.
+    GATE: att-resid↔imp-resid still weak (~≤0.3) → proceed. Strong (≳0.5) → §20.4 pivot
+    (NAVSIM/PlanT or accept the analysis-paper-of-a-negative framing).
+**Phase 1 — architecture + loss upgrades (~1 day code, before any big training).**
+1a. §24.1 items 1-4 (+norm_first) in `zoi_module.py`/`model.py`.
+1b. Importance loss → within-frame pairwise ranking + down-weighted BCE (§23.3.3);
+    self-consistency variance → per-label loss weight.
+1c. Standalone shape/gradient test (repeat §14 procedure); then Stage-1 learnability run on
+    ~1-1.5k frames (existing-style labels fine here).
+    GATE: zoi_loss drops + pred importance correlates with held-out VLM labels → proceed.
+**Phase 2 — supervision widening (schema BEFORE the big run).**
+2a. Prompt+parser emit score + Tier-1 tags (crosses_ego_path / suggested_ego_response /
+    time_criticality) + one-sentence rationale in ONE call; extend .npy schema or sidecar;
+    validity-mask any unparsed field (never default). Update `verify_zoi_coverage.py`.
+2b. Rationale → frozen text-encoder embedding (SigLIP-text or sentence-transformer), stored
+    alongside labels; cosine-loss head + tag heads on matched queries in ZoiModule.
+**Phase 3 — the big labeling run (§24.2): P1 gold, then P2 main.**
+**Phase 4 — training + extended ablation table.** Rows (all fine-tuned identically, Town13 out):
+  1 baseline / 2 random-token / 3 λ=0 unsup / 4 importance-only / 4b +tags / 4c +tags+rationale /
+  5 aux-head-only (supervision w/o token concat — the RSD-mechanism row, §23.4 axis 2) /
+  6 content-free tokens (posenc×imp only) / 7 [1,2] vs [0,1] gate (cheap, optional).
+  VERDICT unchanged: 4x vs 3 on safety-critical subset; 4c vs 4 shows what content carries gain.
+**Phase 5 — eval + paper.** Closed-loop per §19; consider one Bench2Drive or NAVSIM table for
+  legibility vs RSD (§23.4); write-up = analysis framing (controls as headline).
+Kill-switches recap: Phase-0 probe (strong correlation), Phase-1 learnability (can't fit labels),
+Phase-4 (4≈3 AND 4c≈3 → clean negative, still a thesis).
+
+## 25. Teacher bake-off kit (2026-07-06) — portable, runs on a friend's machine
+Phase-0b/0c implementation. STATUS NOTE: the §22.4 fixes turned out to be ALREADY IMPLEMENTED in
+`generate_zoi_labels_gemma4.py` (normalize_exposure, completeness retry guard, describe_object_line
+rich lines — §22.5 TODO item 1 is DONE); the bake-off kit reuses the same logic.
+
+### 25.1 The kit (4 self-contained files, no repo/carla needed on the target machine)
+`teacher_bakeoff.py` + `eval_bakeoff.py` + `zoi_projection.py` + `zoi_prompts.py` (+
+`README_BAKEOFF.md` with env/VRAM/run instructions). Points at the RAW dump (gz-aware,
+double-nesting handled). Teachers: `gemma4` (current baseline), `cosmos8b`/`cosmos32b`/`cosmos2b`
+(NVIDIA Cosmos-Reason2; Qwen3-VL-based, loaded via Qwen3VLForConditionalGeneration with
+AutoModelForImageTextToText fallback; `--load_4bit` for 32B on <70GB), `qwen3vl8b` (Cosmos's BASE
+model — isolates NVIDIA's post-training delta), `internvl` (known reference), `mock` (no-GPU
+pipeline check, exercises the retry path deterministically).
+- Cosmos = reasoning models: model-card `<think>/<answer>` system instruction, 4096-token budget,
+  parser strips the think trace and takes the LAST parseable `{"scores":...}` JSON.
+- **RICH_PROMPT** added to `zoi_prompts.py`: ONE call returns per object `imp` 0-5 + Tier-1 tags
+  (`path` yes/maybe/no, `act` brake/yield/monitor/ignore, `urg` now/soon/none) + `why` (≤15-word
+  rationale) — the §23.2 widened channel at ~unchanged per-frame cost. Exemplar anchors kept.
+- All §22.4 guards active: exposure norm, rich object lines, retry-then-DROP (never silent 0.0);
+  out-of-vocab tags → None (counted, never guessed).
+- Frame list pinned in `<out_root>/frames.json` (first run samples balanced per-scenario
+  round-robin across routes; later runs reuse → every teacher sees IDENTICAL frames).
+- `--passes K` self-consistency (pass 0 greedy + K-1 sampled temp 0.7; imp=mean recorded with
+  imp_std, tags=majority).
+- Outputs per teacher: `labels/<route_rel>/zoi_labels/*.npy` ([M,4], drop-in for
+  `attention_probe.py --labels_root`), `rich_records.jsonl` (full per-object record incl. tags/
+  rationale/omissions/timing), `overlays/` scored marks ("MISS" = dropped), `raw/`, `summary.json`.
+
+### 25.2 eval_bakeoff.py metrics (numpy-only)
+Per teacher (VLM-scored car/walker only, rule rows excluded per §21.2): spread std, range,
+histogram, depth-ρ (tie-averaged Spearman), top1-closest, **nondist_residual** = 1−R² of imp ~
+[closeness, |lateral|] (THE signal-quality number — share of teacher judgment not free from
+geometry), omission rate, parse fails, tag completeness, `imp_by_path` monotonicity,
+contradiction rate (imp≥4 with path=no/act=ignore), rationale coverage/length, s/frame.
+Pairwise: Spearman/Pearson on shared objects + top-disagreement table WITH both teachers'
+rationales (eyeball who is right). Ranking heuristic: reliability gate (omission>0.10 or parse
+fails>5%) first, then residual + 0.5ρ + 0.1spread. Writes `bakeoff_report.md` +
+`bakeoff_metrics.json`.
+
+### 25.3 Protocol
+1. Friend: mock run (pipeline check) → real teachers (gemma4+cosmos8b minimum; cosmos32b
+   `--load_4bit` if VRAM-bound; cosmos2b/qwen3vl8b/internvl optional) → eval → zip `bakeoff_out/`.
+2. Us, on return: run `attention_probe.py --labels_root bakeoff_out/<teacher>/labels` per teacher
+   — the PROJECT verdict metric (att-resid↔imp-resid per §21.3) on each teacher's labels; a
+   teacher whose residual attention correlation is LOW has the most non-redundant signal to teach.
+3. Decision updates §18a (current: Gemma-4+exemplar) and picks the P1/P2 teacher for §24.2.
+Caveat: bake-off metrics are directional at ~200 frames (same small-n caveat as §17/§18a); the
+gold set (§24.2 P1) is what settles it.
