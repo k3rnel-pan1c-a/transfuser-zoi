@@ -110,6 +110,33 @@ def visible_marks(boxes, z_sign=-1.0, classes=VLM_MARK_CLASSES):
     return out
 
 
+def lane_label(y_right):
+    """Coarse lane hint from the exact GT lateral offset (CARLA y is +right).
+    Lane ~3.5 m wide, so |y| < 1.75 is the ego lane; the next band is an adjacent
+    lane; beyond that the object is clearly off the ego's lane. This is the lane
+    signal the exemplar prompt calls "primary" but was never actually given."""
+    side = "right" if y_right >= 0 else "left"
+    a = abs(y_right)
+    if a < 1.75:
+        return "in the ego lane"
+    if a < 5.25:
+        return f"in the adjacent lane to the {side}"
+    return f"well off to the {side}, not the ego lane"
+
+
+def describe_object_line(oid, class_name, pos_xyz):
+    """Build one Set-of-Marks object line from EXACT GT geometry (positions are
+    exact in the dataset, so this costs nothing). Gives the VLM longitudinal +
+    lateral offset + true radial range + a lane hint, instead of the old
+    forward-distance-only "~{depth} m" line that hid all lateral/lane info
+    (ZOI_CONTEXT.md sec 22.3)."""
+    x, y, _ = pos_xyz                       # x forward, y right (ego meters)
+    radial = float(np.hypot(x, y))
+    side = "right" if y >= 0 else "left"
+    return (f'  id {oid}: a {class_name} {x:.0f} m ahead, {abs(y):.0f} m to the {side} '
+            f'(~{radial:.0f} m away, {lane_label(y)})')
+
+
 def draw_marks(img, marks, color=(0, 255, 0), txt_color=(0, 0, 255)):
     """marks: list whose first 3 elements are (id, u, v). Draws a labeled dot."""
     import cv2
