@@ -310,7 +310,6 @@ def discover_routes(root_dir):
     for depth in ("*", os.path.join("*", "*"), os.path.join("*", "*", "*")):
         box_dirs |= {p for p in glob.glob(os.path.join(root_dir, depth, "boxes"))
                      if os.path.isdir(p)}
-    box_dirs = {str(Path(p).parent) for p in box_dirs}
     routes = {}
     for bd in sorted(box_dirs):
         route_dir = str(Path(bd).parent)
