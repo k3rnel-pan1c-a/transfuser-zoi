@@ -112,7 +112,9 @@ TEACHERS = {
 # Model-card instruction for the Cosmos reasoning format; the parser strips the
 # <think> block and reads the JSON from the <answer> (or trailing) text.
 THINK_SYS = ("Answer the question in the following format: <think>\nyour reasoning\n</think>\n\n"
-             "<answer>\nyour answer\n</answer>")
+             "<answer>\nyour answer\n</answer>\n"
+             "Keep the <think> reasoning brief: score each id once, do not re-derive or "
+             "second-guess. You MUST close </think> and emit the complete <answer> JSON.")
 
 TAG_VOCAB = {
     "path": {"yes", "no", "maybe"},
