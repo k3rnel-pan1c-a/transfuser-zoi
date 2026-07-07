@@ -22,6 +22,10 @@ Teachers (pick with --teachers, comma-separated; run any subset):
     qwen3vl8b  Qwen/Qwen3-VL-8B-Instruct             Cosmos2-8B's BASE model — isolates
                                                      what NVIDIA's post-training adds
     internvl   OpenGVLab/InternVL3_5-8B-HF           known reference point (sec 17)
+    internvl38b OpenGVLab/InternVL3_5-38B-HF         scaled-up InternVL (~77 GB bf16 —
+                                                     tight on 80 GB; --load_4bit if OOM)
+    gemma431b  unsloth/gemma-4-31B-it                dense scale-up of the production
+                                                     teacher (~62 GB bf16, fits A100-80GB)
     mock       no GPU / no model — deterministic geometry-based scores; use it to
                verify the whole pipeline end-to-end before burning GPU time
 
@@ -100,6 +104,8 @@ TEACHERS = {
     "cosmos2b":  dict(model_id="nvidia/Cosmos-Reason2-2B",        family="qwen3vl",   reasoning=True),
     "qwen3vl8b": dict(model_id="Qwen/Qwen3-VL-8B-Instruct",       family="qwen3vl",   reasoning=False),
     "internvl":  dict(model_id="OpenGVLab/InternVL3_5-8B-HF",     family="imagetext", reasoning=False),
+    "internvl38b": dict(model_id="OpenGVLab/InternVL3_5-38B-HF",  family="imagetext", reasoning=False),
+    "gemma431b": dict(model_id="unsloth/gemma-4-31B-it",          family="imagetext", reasoning=False),
     "mock":      dict(model_id=None,                              family="mock",      reasoning=False),
 }
 
