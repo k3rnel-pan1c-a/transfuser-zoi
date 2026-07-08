@@ -36,10 +36,11 @@ the reasoning trace and takes the LAST parseable {"scores": ...} JSON object.
 Every teacher labels the IDENTICAL frame list: the first run writes
 <out_root>/frames.json and later runs (any teacher) reuse it.
 
-Label-quality guards from ZOI_CONTEXT.md sec 22.4 are all active: exposure
-normalization of the VLM input, rich object lines (longitudinal + lateral + radial +
-lane hint), and the completeness guard (targeted retry for omitted ids; objects still
-missing after retry are DROPPED from the .npy, never silently 0.0, and logged).
+Label-quality guards from ZOI_CONTEXT.md sec 22.4: rich object lines (longitudinal +
+lateral + radial + lane hint) and the completeness guard (targeted retry for omitted
+ids; objects still missing after retry are DROPPED from the .npy, never silently 0.0,
+and logged). Exposure normalization was removed: large teachers handle dark frames
+natively and the gamma/CLAHE lift degraded some images.
 
 Outputs per teacher under <out_root>/<teacher>/:
     labels/<route_rel>/zoi_labels/<stem>.npy   [M,4] = [x, y, imp 0..1, class_id]
@@ -133,23 +134,6 @@ def load_boxes(boxes_path):
             return json.load(f)
     with open(boxes_path, "r", encoding="utf-8") as f:
         return json.load(f)
-
-
-def normalize_exposure(img_bgr, target=120.0, gamma_floor=0.4, clahe_clip=2.0):
-    """Sec 22.2: dark (night/dusk/rain) frames made Gemma silently drop visible
-    objects; adaptive gamma lift + light CLAHE recovers them. Never darkens."""
-    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    mean = float(gray.mean())
-    out = img_bgr
-    if 1.0 < mean < target:
-        gamma = np.log(target / 255.0) / np.log(mean / 255.0)
-        gamma = float(np.clip(gamma, gamma_floor, 1.0))
-        lut = (np.power(np.arange(256) / 255.0, gamma) * 255.0).astype(np.uint8)
-        out = cv2.LUT(img_bgr, lut)
-    lab = cv2.cvtColor(out, cv2.COLOR_BGR2LAB)
-    l, a, b = cv2.split(lab)
-    l = cv2.createCLAHE(clipLimit=clahe_clip, tileGridSize=(8, 8)).apply(l)
-    return cv2.cvtColor(cv2.merge((l, a, b)), cv2.COLOR_LAB2BGR)
 
 
 def strip_reasoning(text):
@@ -430,7 +414,7 @@ def process_frame(name, model, processor, rgb_path, boxes_path, frame_key,
     if not marks:
         return targets, record, None
 
-    img = normalize_exposure(cv2.imread(str(rgb_path)))
+    img = cv2.imread(str(rgb_path))
     marked = draw_marks(img, marks)
     pil = Image.fromarray(cv2.cvtColor(marked, cv2.COLOR_BGR2RGB))
     prompt = RICH_PROMPT.format(object_list="\n".join(object_lines))
